@@ -1,286 +1,161 @@
 #!/bin/bash
 
-# Network Diagnostic and Fix Script for Rocky Linux Bridge/VLAN Setup
-# Usage: sudo ./network-fix.sh
+# CloudStack Template Registration Script
+# Make sure you have cloudmonkey configured and your zone ID ready
 
-set -e
+# Set your zone ID (replace with your actual zone ID)
+ZONE_ID="MUSTBEFILLEDXD"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
-
-# Logging function
-log() {
-    echo -e "${BLUE}[$(date +'%Y-%m-%d %H:%M:%S')]${NC} $1"
-}
-
-error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-}
-
-success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1"
-}
-
-warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
-}
-
-# Check if running as root
-if [[ $EUID -ne 0 ]]; then
-   error "This script must be run as root (use sudo)"
-   exit 1
-fi
-
-log "Starting network diagnostic and repair..."
-
-# Function to check interface status
-check_interface_status() {
-    local iface=$1
-    local carrier_file="/sys/class/net/$iface/carrier"
+# Function to register templates
+register_template() {
+    local name="$1"
+    local url="$2"
+    local ostypeid="$3"
+    local format="$4"
     
-    if [[ -f "$carrier_file" ]]; then
-        local carrier=$(cat "$carrier_file" 2>/dev/null || echo "0")
-        if [[ "$carrier" == "1" ]]; then
-            echo "UP"
-        else
-            echo "DOWN"
-        fi
-    else
-        echo "NOT_FOUND"
-    fi
-}
-
-# Function to get interface IP
-get_interface_ip() {
-    local iface=$1
-    ip addr show "$iface" 2>/dev/null | grep "inet " | awk '{print $2}' | head -1
-}
-
-# Function to detect gateway from IP range
-detect_gateway() {
-    local ip_with_mask=$1
-    local ip=$(echo "$ip_with_mask" | cut -d'/' -f1)
-    local mask=$(echo "$ip_with_mask" | cut -d'/' -f2)
+    echo "Registering template: $name"
+    cloudmonkey register template \
+        name="$name" \
+        displaytext="$name" \
+        url="$url" \
+        zoneid="$ZONE_ID" \
+        ostypeid="$ostypeid" \
+        hypervisor="KVM" \
+        format="$format" \
+        passwordenabled="false" \
+        sshkeyenabled="true" \
+        ispublic="true" \
+        isfeatured="true" \
+        extractable="true"
     
-    # Extract network portion and assume .225 is gateway for /28 networks
-    local network=$(echo "$ip" | cut -d'.' -f1-3)
-    echo "${network}.225"
+    echo "Template $name registration initiated"
+    echo "----------------------------------------"
 }
 
-log "=== PHASE 1: DIAGNOSTIC ==="
+# Ubuntu Templates
+echo "=== UBUNTU TEMPLATES ==="
+register_template "Ubuntu-24.04" "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img" "25" "QCOW2"
+register_template "Ubuntu-22.04" "https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-amd64.img" "25" "QCOW2"
+register_template "Ubuntu-20.04" "https://cloud-images.ubuntu.com/releases/20.04/release/ubuntu-20.04-server-cloudimg-amd64.img" "25" "QCOW2"
 
-# Check physical interfaces
-log "Checking physical interfaces..."
-for iface in eno1 eno2 eno3 eno4; do
-    status=$(check_interface_status "$iface")
-    ip=$(get_interface_ip "$iface")
-    log "  $iface: Status=$status, IP=${ip:-none}"
-done
+# Debian Templates
+echo "=== DEBIAN TEMPLATES ==="
+register_template "Debian-12" "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2" "60" "QCOW2"
+register_template "Debian-11" "https://cloud.debian.org/images/cloud/bullseye/latest/debian-11-genericcloud-amd64.qcow2" "60" "QCOW2"
 
-# Check VLAN interfaces
-log "Checking VLAN interfaces..."
-for vlan in eno1.100 eno1.200; do
-    if ip link show "$vlan" &>/dev/null; then
-        status=$(check_interface_status "$vlan")
-        log "  $vlan: Status=$status"
-    else
-        warning "  $vlan: Not found"
-    fi
-done
+# Rocky Linux Templates
+echo "=== ROCKY LINUX TEMPLATES ==="
+register_template "Rocky-Linux-9" "https://download.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud.latest.x86_64.qcow2" "27" "QCOW2"
+register_template "Rocky-Linux-8" "https://download.rockylinux.org/pub/rocky/8/images/x86_64/Rocky-8-GenericCloud.latest.x86_64.qcow2" "27" "QCOW2"
 
-# Check bridges
-log "Checking bridges..."
-cloudbr0_ip=$(get_interface_ip "cloudbr0")
-cloudbr1_ip=$(get_interface_ip "cloudbr1")
-cloudbr0_status=$(check_interface_status "cloudbr0")
-cloudbr1_status=$(check_interface_status "cloudbr1")
+# AlmaLinux Templates
+echo "=== ALMALINUX TEMPLATES ==="
+register_template "AlmaLinux-9" "https://repo.almalinux.org/almalinux/9/cloud/x86_64/images/AlmaLinux-9-GenericCloud-latest.x86_64.qcow2" "27" "QCOW2"
+register_template "AlmaLinux-8" "https://repo.almalinux.org/almalinux/8/cloud/x86_64/images/AlmaLinux-8-GenericCloud-latest.x86_64.qcow2" "27" "QCOW2"
 
-log "  cloudbr0: Status=$cloudbr0_status, IP=${cloudbr0_ip:-none}"
-log "  cloudbr1: Status=$cloudbr1_status, IP=${cloudbr1_ip:-none}"
+# CentOS Stream Templates
+echo "=== CENTOS STREAM TEMPLATES ==="
+register_template "CentOS-Stream-9" "https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2" "27" "QCOW2"
+register_template "CentOS-Stream-8" "https://cloud.centos.org/centos/8-stream/x86_64/images/CentOS-Stream-GenericCloud-8-latest.x86_64.qcow2" "27" "QCOW2"
 
-# Check current routing
-log "Checking routing table..."
-default_route=$(ip route show default 2>/dev/null | head -1)
-log "  Default route: ${default_route:-none}"
+# OpenSUSE Templates
+echo "=== OPENSUSE TEMPLATES ==="
+register_template "OpenSUSE-Leap-15.5" "https://download.opensuse.org/repositories/Cloud:/Images:/Leap_15.5/images/openSUSE-Leap-15.5-Minimal-VM.x86_64-Cloud.qcow2" "73" "QCOW2"
+register_template "OpenSUSE-Leap-15.4" "https://download.opensuse.org/repositories/Cloud:/Images:/Leap_15.4/images/openSUSE-Leap-15.4-Minimal-VM.x86_64-Cloud.qcow2" "73" "QCOW2"
 
-# Check DNS
-log "Checking DNS configuration..."
-if [[ -f /etc/resolv.conf ]]; then
-    dns_servers=$(grep "nameserver" /etc/resolv.conf | awk '{print $2}' | tr '\n' ' ')
-    log "  DNS servers: ${dns_servers:-none}"
-fi
+# Oracle Linux Templates
+echo "=== ORACLE LINUX TEMPLATES ==="
+register_template "Oracle-Linux-9" "https://yum.oracle.com/templates/OracleLinux/OL9/u5/x86_64/OL9U5_x86_64-kvm-b259.qcow2" "134" "QCOW2"
+register_template "Oracle-Linux-8" "https://yum.oracle.com/templates/OracleLinux/OL8/u10/x86_64/OL8U10_x86_64-kvm-b258.qcow2" "134" "QCOW2"
 
-log "=== PHASE 2: PROBLEM DETECTION ==="
+# Fedora Templates
+echo "=== FEDORA TEMPLATES ==="
+register_template "Fedora-39" "https://download.fedoraproject.org/pub/fedora/linux/releases/39/Cloud/x86_64/images/Fedora-Cloud-Base-39-1.5.x86_64.qcow2" "175" "QCOW2"
+register_template "Fedora-38" "https://download.fedoraproject.org/pub/fedora/linux/releases/38/Cloud/x86_64/images/Fedora-Cloud-Base-38-1.6.x86_64.qcow2" "175" "QCOW2"
 
-problems=()
-fixes=()
+# Windows Templates (Evaluation versions)
+echo "=== WINDOWS TEMPLATES ==="
+# Note: Download these manually from Microsoft Evaluation Center and upload to your server
+echo "# Download Windows Server evaluations from:"
+echo "# Windows Server 2025: https://www.microsoft.com/en-us/evalcenter/evaluate-windows-server-2025"
+echo "# Windows Server 2022: https://www.microsoft.com/en-us/evalcenter/evaluate-windows-server-2022"
+echo "# Windows Server 2019: https://www.microsoft.com/en-us/evalcenter/evaluate-windows-server-2019"
+echo "# Windows Server 2016: https://www.microsoft.com/en-us/evalcenter/evaluate-windows-server-2016"
+echo "# Windows 11: https://www.microsoft.com/en-us/evalcenter/evaluate-windows-11-enterprise"
+echo "# Windows 10: https://www.microsoft.com/en-us/evalcenter/evaluate-windows-10-enterprise"
+echo ""
+echo "# After downloading, upload to your web server and register with these commands:"
+echo "# register_template \"Windows-Server-2025-Eval\" \"https://your-server.com/windows-server-2025-eval.iso\" \"91\" \"ISO\""
+echo "# register_template \"Windows-Server-2022-Eval\" \"https://your-server.com/windows-server-2022-eval.iso\" \"91\" \"ISO\""
+echo "# register_template \"Windows-Server-2019-Eval\" \"https://your-server.com/windows-server-2019-eval.iso\" \"70\" \"ISO\""
+echo "# register_template \"Windows-Server-2016-Eval\" \"https://your-server.com/windows-server-2016-eval.iso\" \"69\" \"ISO\""
+echo "# register_template \"Windows-11-Enterprise\" \"https://your-server.com/windows-11-enterprise.iso\" \"159\" \"ISO\""
+echo "# register_template \"Windows-10-Enterprise\" \"https://your-server.com/windows-10-enterprise.iso\" \"159\" \"ISO\""
 
-# Check if eno1 is up (required for VLANs)
-eno1_status=$(check_interface_status "eno1")
-if [[ "$eno1_status" != "UP" ]]; then
-    problems+=("eno1 interface is down")
-    fixes+=("bring_up_eno1")
-fi
+# FreeBSD Templates
+echo "=== FREEBSD TEMPLATES ==="
+register_template "FreeBSD-14.1" "https://download.freebsd.org/releases/VM-IMAGES/14.1-RELEASE/amd64/Latest/FreeBSD-14.1-RELEASE-amd64.qcow2.xz" "111" "QCOW2"
+register_template "FreeBSD-13.3" "https://download.freebsd.org/releases/VM-IMAGES/13.3-RELEASE/amd64/Latest/FreeBSD-13.3-RELEASE-amd64.qcow2.xz" "111" "QCOW2"
 
-# Check if we have bridge IPs
-if [[ -z "$cloudbr0_ip" && -z "$cloudbr1_ip" ]]; then
-    problems+=("No IP addresses on bridges")
-    fixes+=("configure_bridge_ips")
-elif [[ -z "$cloudbr0_ip" ]]; then
-    problems+=("cloudbr0 has no IP address")
-    fixes+=("fix_cloudbr0_ip")
-elif [[ -z "$cloudbr1_ip" ]]; then
-    problems+=("cloudbr1 has no IP address")
-    fixes+=("fix_cloudbr1_ip")
-fi
+# OpenBSD Templates  
+echo "=== OPENBSD TEMPLATES ==="
+register_template "OpenBSD-7.4" "https://cdn.openbsd.org/pub/OpenBSD/7.4/amd64/install74.img" "112" "RAW"
 
-# Check default route
-if [[ -z "$default_route" ]]; then
-    problems+=("No default route configured")
-    fixes+=("add_default_route")
-fi
+# NetBSD Templates
+echo "=== NETBSD TEMPLATES ==="
+register_template "NetBSD-10.0" "https://cdn.netbsd.org/pub/NetBSD/NetBSD-10.0/images/NetBSD-10.0-amd64.img.gz" "113" "RAW"
 
-# Check DNS
-if [[ -z "$dns_servers" ]]; then
-    problems+=("No DNS servers configured")
-    fixes+=("configure_dns")
-fi
+# Alpine Linux Templates
+echo "=== ALPINE LINUX TEMPLATES ==="
+register_template "Alpine-Linux-3.19" "https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/cloud/alpine-cloud-3.19.1-x86_64-uefi.qcow2" "175" "QCOW2"
+register_template "Alpine-Linux-3.18" "https://dl-cdn.alpinelinux.org/alpine/v3.18/releases/cloud/alpine-cloud-3.18.6-x86_64-uefi.qcow2" "175" "QCOW2"
 
-if [[ ${#problems[@]} -eq 0 ]]; then
-    success "No obvious problems detected. Testing connectivity..."
-else
-    warning "Found ${#problems[@]} problem(s):"
-    for problem in "${problems[@]}"; do
-        warning "  - $problem"
-    done
-fi
+# Arch Linux Templates
+echo "=== ARCH LINUX TEMPLATES ==="
+register_template "Arch-Linux" "https://geo.mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-cloudimg.qcow2" "175" "QCOW2"
 
-log "=== PHASE 3: FIXES ==="
+# Clear Linux Templates
+echo "=== CLEAR LINUX TEMPLATES ==="
+register_template "Clear-Linux" "https://download.clearlinux.org/releases/current/clear/clear-cloudguest.img.xz" "175" "QCOW2"
 
-# Function implementations
-bring_up_eno1() {
-    log "Bringing up eno1 interface..."
-    if nmcli connection show eno1 &>/dev/null; then
-        nmcli connection up eno1
-    else
-        log "Creating eno1 connection..."
-        nmcli connection add type ethernet con-name eno1 ifname eno1 \
-            ipv4.method disabled ipv6.method link-local connection.autoconnect yes
-        nmcli connection up eno1
-    fi
-    sleep 2
-}
+# NixOS Templates
+echo "=== NIXOS TEMPLATES ==="
+register_template "NixOS-23.11" "https://channels.nixos.org/nixos-23.11/latest-nixos-x86_64-linux.ova" "175" "OVA"
 
-configure_bridge_ips() {
-    log "Configuring bridge IP addresses..."
-    # This would need specific IP configuration - using placeholders
-    warning "Bridge IP configuration requires manual setup with your specific IPs"
-}
+# Kali Linux Templates
+echo "=== KALI LINUX TEMPLATES ==="
+register_template "Kali-Linux-2024.1" "https://kali.download/cloud-images/kali-2024.1/kali-linux-2024.1-cloud-amd64.tar.xz" "60" "QCOW2"
 
-fix_cloudbr0_ip() {
-    log "Attempting to fix cloudbr0 IP configuration..."
-    nmcli connection up cloudbr0 || warning "Failed to bring up cloudbr0"
-}
+# Container-Optimized Templates
+echo "=== CONTAINER-OPTIMIZED TEMPLATES ==="
+register_template "Flatcar-Container-Linux" "https://stable.release.flatcar-linux.net/amd64-usr/current/flatcar_production_qemu_image.img.bz2" "175" "QCOW2"
+register_template "Fedora-CoreOS" "https://builds.coreos.fedoraproject.org/prod/streams/stable/builds/39.20240128.3.0/x86_64/fedora-coreos-39.20240128.3.0-qemu.x86_64.qcow2.xz" "175" "QCOW2"
 
-fix_cloudbr1_ip() {
-    log "Attempting to fix cloudbr1 IP configuration..."
-    nmcli connection up cloudbr1 || warning "Failed to bring up cloudbr1"
-}
+# Cloud-Native Templates
+echo "=== CLOUD-NATIVE TEMPLATES ==="
+register_template "RancherOS-2" "https://github.com/rancher/os2/releases/download/v2.0.0-alpha1/rancheros-2.0.0-alpha1-amd64.iso" "175" "ISO"
 
-add_default_route() {
-    log "Adding default route..."
-    # Determine which bridge should have the default route
-    local main_ip=""
-    local gateway=""
-    
-    if [[ -n "$cloudbr0_ip" ]]; then
-        main_ip="$cloudbr0_ip"
-        gateway=$(detect_gateway "$cloudbr0_ip")
-        ip route add default via "$gateway" dev cloudbr0 2>/dev/null || warning "Failed to add default route via cloudbr0"
-    elif [[ -n "$cloudbr1_ip" ]]; then
-        main_ip="$cloudbr1_ip"
-        gateway=$(detect_gateway "$cloudbr1_ip")
-        ip route add default via "$gateway" dev cloudbr1 2>/dev/null || warning "Failed to add default route via cloudbr1"
-    fi
-    
-    if [[ -n "$gateway" ]]; then
-        log "Added default route via $gateway"
-    fi
-}
+# Specialized Templates
+echo "=== SPECIALIZED TEMPLATES ==="
+register_template "pfSense-CE" "https://files.netgate.com/file/pfsense-ce-memstick/2.7.2/pfSense-CE-memstick-2.7.2-RELEASE-amd64.img.gz" "175" "RAW"
+register_template "OPNsense" "https://mirror.ams1.nl.leaseweb.net/opnsense/releases/24.1/OPNsense-24.1-nano-amd64.img.bz2" "175" "RAW"
 
-configure_dns() {
-    log "Configuring DNS servers..."
-    echo "nameserver 8.8.8.8" > /etc/resolv.conf
-    echo "nameserver 8.8.4.4" >> /etc/resolv.conf
-}
-
-# Execute fixes
-for fix in "${fixes[@]}"; do
-    log "Executing fix: $fix"
-    $fix
-done
-
-log "=== PHASE 4: CONNECTIVITY TEST ==="
-
-# Test connectivity
-test_connectivity() {
-    local target=$1
-    local description=$2
-    
-    log "Testing $description ($target)..."
-    if ping -c 3 -W 2 "$target" &>/dev/null; then
-        success "  ✓ $description reachable"
-        return 0
-    else
-        error "  ✗ $description unreachable"
-        return 1
-    fi
-}
-
-# Find gateway to test
-gateway=""
-if [[ -n "$cloudbr0_ip" ]]; then
-    gateway=$(detect_gateway "$cloudbr0_ip")
-elif [[ -n "$cloudbr1_ip" ]]; then
-    gateway=$(detect_gateway "$cloudbr1_ip")
-fi
-
-connectivity_ok=true
-
-if [[ -n "$gateway" ]]; then
-    test_connectivity "$gateway" "Gateway" || connectivity_ok=false
-fi
-
-test_connectivity "8.8.8.8" "Internet (Google DNS)" || connectivity_ok=false
-test_connectivity "google.com" "DNS resolution" || connectivity_ok=false
-
-log "=== FINAL STATUS ==="
-
-if [[ "$connectivity_ok" == true ]]; then
-    success "Network connectivity is working!"
-else
-    error "Network connectivity issues remain. Manual intervention may be required."
-    
-    log "=== MANUAL TROUBLESHOOTING SUGGESTIONS ==="
-    warning "Try these manual steps:"
-    warning "1. Check bridge configuration: brctl show"
-    warning "2. Restart NetworkManager: systemctl restart NetworkManager"
-    warning "3. Check specific interface routing: ip route get 8.8.8.8"
-    warning "4. Verify VLAN configuration: ip link show | grep vlan"
-    
-    # Show current network state for debugging
-    log "=== CURRENT NETWORK STATE ==="
-    log "IP addresses:"
-    ip addr show | grep -E "^[0-9]+:|inet " | sed 's/^/  /'
-    
-    log "Routing table:"
-    ip route show | sed 's/^/  /'
-    
-    log "Bridge status:"
-    brctl show 2>/dev/null | sed 's/^/  /' || warning "brctl not available"
-fi
-
-log "Network diagnostic and repair script completed."
+echo ""
+echo "=== TEMPLATE REGISTRATION COMPLETE ==="
+echo "Check template download progress in CloudStack web UI under Templates"
+echo "Templates will change from 'Not Ready' to 'Ready' once downloaded"
+echo ""
+echo "Common OS Type IDs:"
+echo "25 = Ubuntu"
+echo "27 = CentOS/RHEL/Rocky/Alma"
+echo "60 = Debian"
+echo "69 = Windows Server 2016"
+echo "70 = Windows Server 2019"
+echo "91 = Windows Server 2022/2025"
+echo "73 = OpenSUSE"
+echo "111 = FreeBSD"
+echo "112 = OpenBSD"
+echo "113 = NetBSD"
+echo "134 = Oracle Linux"
+echo "159 = Windows Desktop (10/11)"
+echo "175 = Other Linux (Fedora/Alpine/Arch/etc)"
