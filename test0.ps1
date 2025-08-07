@@ -18,62 +18,60 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 # Or To run a script directly with bypass:
 powershell.exe -ExecutionPolicy Bypass -File "YourScript.ps1"
 #>
-
-# ---------- logging ----------
+# ───────────────────────── LOGGING ─────────────────────────
 $log = 'C:\cloudstack-prep.log'
 try   { Start-Transcript -Path $log -Append }
 catch { $log = "C:\cloudstack-prep_{0}.log" -f (Get-Date -Format 'yyyyMMdd_HHmmss')
         Start-Transcript -Path $log -Append }
 function Step { param([string]$m) ; Write-Host ">> $m" }
 
-# ---------- 1. optimise OS ----------
+# ─────────────────── 1. OS OPTIMISATION ───────────────────
 function Optimize-OS {
-    Step 'Balanced power plan'
-    powercfg /setactive SCHEME_BALANCED | Out-Null
+    Step 'Balanced power plan';   powercfg /setactive SCHEME_BALANCED | Out-Null
 
     Step 'Enable RDP + NLA + firewall'
-    Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' fDenyTSConnections 0
-    Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' UserAuthentication 1
+    Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' fDenyTSConnections 0
+    Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' UserAuthentication 1
     Set-Service TermService -StartupType Automatic
     if ((Get-Service TermService).Status -ne 'Running') { Start-Service TermService }
     Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
 
-    Step 'TCP global tweaks (best-effort – unsupported flags are ignored)'
+    Step 'TCP global flags (best-effort – unsupported ones ignored)'
     foreach ($flag in @('rss=enabled','autotuninglevel=normal','chimney=disabled')) {
         cmd /c "netsh interface tcp set global $flag >nul 2>nul"
-    }
+    }                                             # Microsoft docs on per-flag safety :contentReference[oaicite:0]{index=0}
 }
 
-# ---------- 2. pagefile ----------
+# ─────────────────── 2. PAGEFILE FIX ──────────────────────
 function Fix-Pagefile {
     Step 'Pagefile → Automatic on C:'
     wmic computersystem where name="%COMPUTERNAME%" set AutomaticManagedPagefile=True  >$null 2>&1
-    wmic pagefileset where "name!='C:\\\\pagefile.sys'" delete                          >$null 2>&1
+    wmic pagefileset   where "name!='C:\\\\pagefile.sys'" delete                        >$null 2>&1
 }
 
-# ---------- 3. clean Windows ----------
+# ─────────────────── 3. WINDOWS CLEAN-UP ──────────────────
 function Cleanup-Windows {
-    Step 'Clear TEMP folders'
-    Get-ChildItem "$env:TEMP","C:\Windows\Temp" -Recurse -Force -ErrorAction SilentlyContinue |
-        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    Step 'Flush TEMP folders'
+    Get-ChildItem "$env:TEMP","C:\Windows\Temp" -Recurse -Force -EA SilentlyContinue |
+        Remove-Item -Recurse -Force -EA SilentlyContinue
 
-    Step 'Flush Windows Update cache'
+    Step 'Flush Windows Update download cache'
     Stop-Service wuauserv -Force
-    Remove-Item -Recurse -Force 'C:\Windows\SoftwareDistribution\Download\*' -ErrorAction SilentlyContinue
+    Remove-Item -Recurse -Force 'C:\Windows\SoftwareDistribution\Download\*' -EA SilentlyContinue
     Start-Service wuauserv
 
     Step 'Trim WinSxS (modern builds only)'
-    if ([Environment]::OSVersion.Version.Build -ge 14393) {
+    if ([Environment]::OSVersion.Version.Build -ge 14393) {   # 1607 / Server 2016+
         Dism.exe /online /Cleanup-Image /StartComponentCleanup /ResetBase | Out-Null
     }
 
-    Step 'Clear event logs (protected logs skipped silently)'
+    Step 'Clear event logs – protected logs silently skipped'
     foreach ($logName in & wevtutil el) { & wevtutil cl "$logName" 1>$null 2>$null }
 }
 
-# ---------- 4. VirtIO guest-tools ----------
+# ─────────────────── 4. VIRTIO 0.1.271 ────────────────────
 function Install-VirtioDrivers {
-    if (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+    if (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*' -EA SilentlyContinue |
         Where-Object { $_.DisplayName -match 'VirtIO.*Guest.*Tools' }) {
         Step 'VirtIO Guest-Tools already installed – skipping';  return
     }
@@ -83,10 +81,10 @@ function Install-VirtioDrivers {
     $arch = if ([Environment]::Is64BitOperatingSystem) { 'x64' } else { 'x86' }
     $msi  = "$env:TEMP\virtio-gt-$arch.msi"
     $url1 = "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/virtio-win-0.1.271-1/virtio-win-gt-$arch.msi"
-    $url2 = "https://fedora-virt.repo.nfrance.com/virtio-win/direct-downloads/stable-virtio/virtio-win-gt-$arch.msi"   # mirror
+    $url2 = "https://fedora-virt.repo.nfrance.com/virtio-win/direct-downloads/stable-virtio/virtio-win-gt-$arch.msi"   # alternate mirror :contentReference[oaicite:1]{index=1}
 
-    try   { Invoke-WebRequest $url1 -OutFile $msi -UseBasicParsing -ErrorAction Stop }
-    catch { Step 'Primary mirror failed – using mirror 2'
+    try   { Invoke-WebRequest $url1 -OutFile $msi -UseBasicParsing -EA Stop }
+    catch { Step 'Mirror-1 failed – using mirror-2'
             Invoke-WebRequest $url2 -OutFile $msi -UseBasicParsing }
 
     Step 'Install VirtIO Guest-Tools silently'
@@ -95,9 +93,9 @@ function Install-VirtioDrivers {
     Step 'VirtIO Guest-Tools installed.'
 }
 
-# ---------- 5. Cloud-Init ----------
+# ─────────────────── 5. CLOUDBASE-INIT ───────────────────
 function Install-CloudInit {
-    if (Get-Service cloudbase-init -ErrorAction SilentlyContinue) {
+    if (Get-Service cloudbase-init -EA SilentlyContinue) {
         Step 'Cloudbase-Init already installed – skipping';  return
     }
 
@@ -108,7 +106,7 @@ function Install-CloudInit {
     $pri  = "https://www.cloudbase.it/downloads/CloudbaseInitSetup_Stable_${arch}.msi"
     $bak  = "https://github.com/cloudbase/cloudbase-init/releases/latest/download/CloudbaseInitSetup_${arch}.msi"
 
-    try   { Invoke-WebRequest $pri -OutFile $msi -UseBasicParsing -ErrorAction Stop }
+    try   { Invoke-WebRequest $pri -OutFile $msi -UseBasicParsing -EA Stop }
     catch { Step 'Primary mirror failed – using GitHub'
             Invoke-WebRequest $bak -OutFile $msi -UseBasicParsing }
 
@@ -117,7 +115,7 @@ function Install-CloudInit {
           -Wait -PassThru).ExitCode
     if ($rc) { throw "Cloudbase-Init installer exited with code $rc" }
 
-    Step 'Configure Cloudbase-Init for CloudStack'
+    Step 'Configure Cloudbase-Init for CloudStack metadata'
     $conf = "$env:ProgramFiles\Cloudbase Solutions\Cloudbase-Init\conf\cloudbase-init.conf"
 @'
 [DEFAULT]
@@ -133,9 +131,9 @@ plugins               = cloudbaseinit.plugins.common.setuserpassword.SetUserPass
     Step 'Cloudbase-Init ready.'
 }
 
-# ---------- 6. unattend.xml ----------
+# ─────────────────── 6. UNATTEND.XML ─────────────────────
 function Write-Unattend {
-    Step 'Writing C:\unattend.xml'
+    Step 'Write C:\unattend.xml (preserves VirtIO after Sysprep)'
 @'
 <?xml version="1.0" encoding="utf-8"?>
 <unattend xmlns="urn:schemas-microsoft-com:unattend">
@@ -152,7 +150,7 @@ function Write-Unattend {
 '@ | Out-File 'C:\unattend.xml' -Encoding UTF8 -Force
 }
 
-# ---------- 7. execute ----------
+# ─────────────────── 7. RUN ALL ────────────────────────
 try {
     Optimize-OS
     Fix-Pagefile
@@ -160,9 +158,11 @@ try {
     Install-VirtioDrivers
     Install-CloudInit
     Write-Unattend
-    Step '✔ Preparation complete — reboot, then sysprep with C:\unattend.xml when ready.'
+    Step '✔ Prep complete — reboot once, then sysprep with:'
+    Step '   %windir%\System32\Sysprep\Sysprep.exe /generalize /oobe /shutdown /unattend:C:\unattend.xml'
 } catch {
-    Write-Error "ERROR: $($_.Exception.Message)";  Exit 1
+    Write-Error "ERROR: $($_.Exception.Message)"
+    Exit 1
 } finally {
     Stop-Transcript
     Write-Host "Log saved to $log"
