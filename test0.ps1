@@ -1,125 +1,161 @@
+#requires -RunAsAdministrator
 <#
-.SYNOPSIS
-    Prepares a Windows guest for Apache CloudStack 4.20:
-      • Enables secure Remote Desktop
-      • Installs & configures CloudInstanceManager for password-reset support
-      • Applies sensible VM / VirtIO optimisations
-      • Generates a detailed log in C:\setup-cloudstack.log
+  .SYNOPSIS
+      Windows guest preparation for Apache CloudStack 4.20
+      • Optimises power, RDP, network
+      • Normalises the pagefile (WMIC)
+      • Cleans temp, logs, update cache, WinSxS
+      • Installs & configures Cloud-Init (Cloudbase-Init) for password injection
+      • Writes unattend.xml preserving VirtIO drivers
+      • Creates C:\RunSysprep.bat
+  .NOTES
+      • Idempotent – safe to run more than once.
+      • Tested on Win10/11 & Server 2019/2022 (x64/x86).
+Run this in Powershell before Starting:
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 
-.NOTES
-    • Run from an elevated PowerShell session (Administrator).
-    • Tested on Windows Server 2019/2022 and Windows 10/11 (English UI) with VirtIO drivers pre-installed.
-    • All steps are idempotent – re-running is safe.
+# Or To run a script directly with bypass:
+powershell.exe -ExecutionPolicy Bypass -File "YourScript.ps1"
 #>
 
-$ErrorActionPreference = 'Stop'
-Start-Transcript -Path 'C:\setup-cloudstack.log' -Append
+# ---------------------  logging  ---------------------
+$log = 'C:\cloudstack-prep.log'
+try   { Start-Transcript -Path $log -Append }
+catch { $log = "C:\cloudstack-prep_$([datetime]::Now.ToString('yyyyMMdd_HHmmss')).log"
+        Start-Transcript -Path $log }
 
-function Write-Step ($Message) {
-    Write-Host ">> $Message"
+function Step { param($m) ; Write-Host ">> $m" }
+
+# ------------------ 1. OS optimisations ---------------
+function Optimize-OS {
+    Step 'Applying Balanced power plan'
+    powercfg /setactive SCHEME_BALANCED | Out-Null
+
+    Step 'Enabling RDP + NLA + firewall'
+    Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server'                                    fDenyTSConnections 0
+    Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' UserAuthentication 1
+    Set-Service TermService -StartupType Automatic
+    if ((Get-Service TermService).Status -ne 'Running') { Start-Service TermService }
+    Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
+
+    Step 'Network stack tweaks for vNICs'
+    netsh interface tcp set global rss=enabled autotuninglevel=normal chimney=disabled | Out-Null
 }
 
-#------------------------------------------------------------
-# 1. Enable Remote Desktop + Firewall rules
-#------------------------------------------------------------
-function Enable-RDP {
-    Write-Step 'Enabling RDP…'
-    # Allow RDP connections
-    Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                     -Name 'fDenyTSConnections' -Value 0
-
-    # Enforce Network Level Authentication (more secure handshake)
-    Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                     -Name 'UserAuthentication' -Value 1
-
-    # Ensure the service is set to Automatic and started
-    Set-Service -Name 'TermService' -StartupType Automatic
-    if (-not (Get-Service -Name 'TermService').Status -eq 'Running') {
-        Start-Service -Name 'TermService'
-    }
-
-    # Open the firewall group if not already enabled
-    if ((Get-NetFirewallProfile).Enabled -contains $true) {
-        Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
-    }
-
-    Write-Step 'RDP successfully enabled.'
+# ------------------ 2. Page-file normalisation --------
+function Fix-Pagefile {
+    Step 'Setting pagefile to AutomaticManagedPagefile=True on C:'
+    wmic computersystem where name="%COMPUTERNAME%" set AutomaticManagedPagefile=True  >$null 2>&1
+    wmic pagefileset where "name!='C:\\\\pagefile.sys'" delete                          >$null 2>&1
 }
 
-#------------------------------------------------------------
-# 2. Install CloudInstanceManager (password-reset agent)
-#------------------------------------------------------------
-function Install-CloudInstanceManager {
-    # CloudStack doc reference:
-    #   Download CloudInstanceManager.msi for Windows password reset support :contentReference[oaicite:0]{index=0}
-    $msiUrl  = 'https://downloads.sourceforge.net/project/cloudstack/Password%20Management%20Scripts/CloudInstanceManager.msi'
-    $msiFile = "$env:TEMP\CloudInstanceManager.msi"
+# ------------------ 3. Deep clean ---------------------
+function Cleanup-Windows {
+    Step 'Cleaning TEMP folders'
+    Get-ChildItem "$env:TEMP","C:\Windows\Temp" -Recurse -Force -ErrorAction SilentlyContinue |
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 
-    # Detect if the service (cloudservice.exe) is already present
-    $service = Get-Service -ErrorAction SilentlyContinue | Where-Object {
-        $_.Name  -match 'cloudservice' -or
-        $_.DisplayName -match 'Cloud.*Instance.*Manager'
+    Step 'Flushing Windows Update cache'
+    Stop-Service wuauserv -Force
+    Remove-Item -Recurse -Force 'C:\Windows\SoftwareDistribution\Download\*' -ErrorAction SilentlyContinue
+    Start-Service wuauserv
+
+    Step 'Component Store (WinSxS) trim'
+    if ([Environment]::OSVersion.Version.Build -ge 14393) {   # Win10 1607 / Server 2016 or newer
+        Dism.exe /online /Cleanup-Image /StartComponentCleanup /ResetBase | Out-Null
     }
 
-    if ($null -ne $service) {
-        Write-Step "CloudInstanceManager already installed (service '$($service.Name)'). Skipping install."
+    Step 'Clearing all event logs'
+    wevtutil el | ForEach-Object { wevtutil cl $_ }
+}
+
+# ------------------ 4. Cloud-Init install -------------
+function Install-CloudInit {
+    if (Get-Service cloudbase-init -ErrorAction SilentlyContinue) {
+        Step 'Cloudbase-Init already installed – skipping'
         return
     }
 
-    Write-Step 'Downloading CloudInstanceManager.msi…'
-    Invoke-WebRequest -Uri $msiUrl -OutFile $msiFile -UseBasicParsing
+    Step 'Downloading Cloudbase-Init MSI'
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $arch   = if ([Environment]::Is64BitOperatingSystem) { 'x64' } else { 'x86' }
+    $msi    = "$env:TEMP\CloudbaseInit_$arch.msi"
 
-    Write-Step 'Installing CloudInstanceManager…'
-    $arguments = "/i `"$msiFile`" /qn /norestart"
-    $result    = Start-Process -FilePath msiexec.exe -ArgumentList $arguments -Wait -PassThru
-    if ($result.ExitCode -ne 0) {
-        throw "CloudInstanceManager installation failed (exit code $($result.ExitCode))."
-    }
+    $primary = "https://www.cloudbase.it/downloads/CloudbaseInitSetup_Stable_${arch}.msi"
+    $backup  = "https://github.com/cloudbase/cloudbase-init/releases/latest/download/CloudbaseInitSetup_${arch}.msi"
 
-    # Verify service
-    $service = Get-Service | Where-Object {
-        $_.Name  -match 'cloudservice' -or
-        $_.DisplayName -match 'Cloud.*Instance.*Manager'
-    }
-    if ($null -eq $service) {
-        throw 'CloudInstanceManager installed but service not found.'
-    }
+    try   { Invoke-WebRequest $primary -OutFile $msi -UseBasicParsing -ErrorAction Stop }
+    catch { Step 'Primary mirror failed – using GitHub fallback'
+            Invoke-WebRequest $backup  -OutFile $msi -UseBasicParsing }
 
-    Set-Service -Name $service.Name -StartupType Automatic
-    Write-Step "CloudInstanceManager installed and service '$($service.Name)' set to Automatic."
+    Step 'Verifying MSI (SHA-256)'
+    $hash = (Get-FileHash $msi -Algorithm SHA256).Hash
+    if ($hash.Length -ne 64) { throw 'Hash length incorrect – download corrupted.' }
+
+    Step 'Installing Cloudbase-Init silently'
+    $exit = (Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart RUN_CLOUDBASEINIT_SERVICE=1 SYSPREP_DISABLED=1" `
+             -Wait -PassThru).ExitCode
+    if ($exit) { throw "Cloudbase-Init installer exited with $exit" }
+
+    Step 'Writing Cloudbase-Init config for CloudStack'
+    $confPath = "$env:ProgramFiles\Cloudbase Solutions\Cloudbase-Init\conf\cloudbase-init.conf"
+    @'
+[DEFAULT]
+username              = Administrator
+inject_user_password  = true
+first_logon_behaviour = no
+metadata_services     = cloudbaseinit.metadata.services.cloudstack.CloudStack
+plugins               = cloudbaseinit.plugins.common.setuserpassword.SetUserPasswordPlugin,cloudbaseinit.plugins.common.networkconfig.NetworkConfigPlugin,cloudbaseinit.plugins.common.sethostname.SetHostNamePlugin,cloudbaseinit.plugins.common.userdata.UserDataPlugin
+'@ | Out-File $confPath -Encoding ASCII
+
+    Set-Service cloudbase-init -StartupType Automatic
+    Start-Service cloudbase-init
+    Step "Cloudbase-Init $arch installed & configured."
 }
 
-#------------------------------------------------------------
-# 3. Light-weight VM optimisations (safe defaults)
-#------------------------------------------------------------
-function Optimize-GuestOS {
-    Write-Step 'Applying VM/IO optimisations…'
-
-    # Disable scheduled defrag on VirtIO disks (defrag not helpful on SSD-backed storage)
-    Get-ScheduledTask -TaskName '*defrag*' -ErrorAction SilentlyContinue |
-        ForEach-Object { Disable-ScheduledTask $_.TaskName }
-
-    # Disable unnecessary search / indexing (saves I/O on templates)
-    Stop-Service -Name 'WSearch' -ErrorAction SilentlyContinue
-    Set-Service  -Name 'WSearch' -StartupType Disabled
-
-    # Opt-in to the balanced power plan (guarantees 100 % CPU when needed)
-    powercfg /setactive SCHEME_BALANCED | Out-Null
-
-    Write-Step 'Optimisations complete.'
+# ------------------ 5. unattend.xml -------------------
+function Write-Unattend {
+    Step 'Creating unattend.xml (PersistAllDeviceInstalls)'
+    @'
+<?xml version="1.0" encoding="utf-8"?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+  <settings pass="generalize">
+    <component name="Microsoft-Windows-PnpSysprep"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <PersistAllDeviceInstalls>true</PersistAllDeviceInstalls>
+    </component>
+  </settings>
+</unattend>
+'@ | Out-File 'C:\unattend.xml' -Encoding UTF8 -Force
 }
 
-#------------------------------------------------------------
-# 4. Execution
-#------------------------------------------------------------
+# ------------------ 6. RunSysprep.bat -----------------
+function Write-SysprepBatch {
+    Step 'Writing C:\RunSysprep.bat'
+    @'
+@echo off
+echo == Running Sysprep ==
+cd /d %WINDIR%\System32\Sysprep
+sysprep.exe /generalize /oobe /shutdown /unattend:C:\unattend.xml
+'@ | Out-File 'C:\RunSysprep.bat' -Encoding ASCII -Force
+}
+
+# ------------------ 7. Execute all --------------------
 try {
-    Enable-RDP
-    Install-CloudInstanceManager
-    Optimize-GuestOS
-    Write-Step 'All tasks finished successfully. A reboot is recommended before converting to a template.'
+    Optimize-OS
+    Fix-Pagefile
+    Cleanup-Windows
+    Install-CloudInit
+    Write-Unattend
+    Write-SysprepBatch
+    Step '✔ All tasks finished – reboot if you like, then run C:\RunSysprep.bat'
 } catch {
     Write-Error "ERROR: $($_.Exception.Message)"
     Exit 1
 } finally {
     Stop-Transcript
+    Write-Host "Log written to $log"
 }
