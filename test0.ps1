@@ -8,19 +8,22 @@
     • Install & configure Cloudbase-Init for CloudStack password injection
     • Write C:\unattend.xml (keeps VirtIO drivers after Sysprep)
     • Fully idempotent – safe to re-run
-    • Run this in Powershell before Starting:
-    • Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
-
-    • Or To run a script directly with bypass:
-    • powershell.exe -ExecutionPolicy Bypass -File "YourScript.ps1"
 #>
 
 # ───────────────────────── LOGGING ─────────────────────────
 $log = 'C:\cloudstack-prep.log'
-try   { Start-Transcript -Path $log -Append }
-catch { $log = "C:\cloudstack-prep_{0}.log" -f (Get-Date -Format 'yyyyMMdd_HHmmss')
-        Start-Transcript -Path $log -Append }
-function Step { param([string]$m) ; Write-Host ">> $m" -ForegroundColor Cyan }
+try { 
+    Start-Transcript -Path $log -Append 
+}
+catch { 
+    $log = "C:\cloudstack-prep_{0}.log" -f (Get-Date -Format 'yyyyMMdd_HHmmss')
+    Start-Transcript -Path $log -Append 
+}
+
+function Step { 
+    param([string]$m) 
+    Write-Host ">> $m" -ForegroundColor Cyan 
+}
 
 # ─────────────────── 1. OS OPTIMISATION ───────────────────
 function Optimize-OS {
@@ -28,10 +31,12 @@ function Optimize-OS {
     powercfg /setactive SCHEME_BALANCED | Out-Null
 
     Step 'Enable RDP + NLA + firewall'
-    Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
-    Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 1
+    Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
+    Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 1
     Set-Service TermService -StartupType Automatic
-    if ((Get-Service TermService).Status -ne 'Running') { Start-Service TermService }
+    if ((Get-Service TermService).Status -ne 'Running') { 
+        Start-Service TermService 
+    }
     Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
 
     Step 'TCP global flags (best-effort – unsupported ones ignored)'
@@ -44,8 +49,8 @@ function Optimize-OS {
 # ─────────────────── 2. PAGEFILE FIX ──────────────────────
 function Fix-Pagefile {
     Step 'Pagefile → Automatic on C:'
-    wmic computersystem where name=`"%COMPUTERNAME%`" set AutomaticManagedPagefile=True >$null 2>&1
-    wmic pagefileset where `"name!='C:\\\\pagefile.sys'`" delete >$null 2>&1
+    wmic computersystem where name="%COMPUTERNAME%" set AutomaticManagedPagefile=True >$null 2>&1
+    wmic pagefileset where "name!='C:\\\\pagefile.sys'" delete >$null 2>&1
 }
 
 # ─────────────────── 3. WINDOWS CLEAN-UP ──────────────────
@@ -67,12 +72,12 @@ function Cleanup-Windows {
 
     Step 'Trim WinSxS (modern builds only)'
     if ([Environment]::OSVersion.Version.Build -ge 14393) {   # 1607 / Server 2016+
-        $null = Dism.exe /online /Cleanup-Image /StartComponentCleanup /ResetBase 2>&1
+        Dism.exe /online /Cleanup-Image /StartComponentCleanup /ResetBase | Out-Null
     }
 
     Step 'Clear event logs – protected logs silently skipped'
-    wevtutil el | ForEach-Object { 
-        wevtutil cl "$_" 2>$null 
+    foreach ($logName in & wevtutil el) { 
+        & wevtutil cl "$logName" 1>$null 2>$null 
     }
 }
 
@@ -108,9 +113,9 @@ function Install-VirtioDrivers {
     }
 
     Step 'Install VirtIO Guest-Tools silently'
-    $proc = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -PassThru
-    if ($proc.ExitCode -ne 0) { 
-        throw "VirtIO installer exited with code $($proc.ExitCode)" 
+    $rc = (Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -PassThru).ExitCode
+    if ($rc) { 
+        throw "VirtIO installer exited with code $rc" 
     }
     Step 'VirtIO Guest-Tools installed successfully'
 }
@@ -126,16 +131,16 @@ function Install-CloudInit {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     $arch = if ([Environment]::Is64BitOperatingSystem) { 'x64' } else { 'x86' }
     $msi  = "$env:TEMP\CloudbaseInit_$arch.msi"
-    $primaryUrl = "https://www.cloudbase.it/downloads/CloudbaseInitSetup_Stable_${arch}.msi"
-    $backupUrl  = "https://github.com/cloudbase/cloudbase-init/releases/latest/download/CloudbaseInitSetup_${arch}.msi"
+    $pri  = "https://www.cloudbase.it/downloads/CloudbaseInitSetup_Stable_${arch}.msi"
+    $bak  = "https://github.com/cloudbase/cloudbase-init/releases/latest/download/CloudbaseInitSetup_${arch}.msi"
 
     try {
-        Invoke-WebRequest $primaryUrl -OutFile $msi -UseBasicParsing -ErrorAction Stop
+        Invoke-WebRequest $pri -OutFile $msi -UseBasicParsing -ErrorAction Stop
     }
     catch {
         Step 'Primary mirror failed – trying GitHub'
         try {
-            Invoke-WebRequest $backupUrl -OutFile $msi -UseBasicParsing -ErrorAction Stop
+            Invoke-WebRequest $bak -OutFile $msi -UseBasicParsing -ErrorAction Stop
         }
         catch {
             throw "Failed to download Cloudbase-Init from both sources"
@@ -143,10 +148,10 @@ function Install-CloudInit {
     }
 
     Step 'Install Cloudbase-Init silently'
-    $proc = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart RUN_CLOUDBASEINIT_SERVICE=1 SYSPREP_DISABLED=1" `
-                         -Wait -PassThru
-    if ($proc.ExitCode -ne 0) {
-        throw "Cloudbase-Init installer exited with code $($proc.ExitCode)"
+    $rc = (Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart RUN_CLOUDBASEINIT_SERVICE=1 SYSPREP_DISABLED=1" `
+          -Wait -PassThru).ExitCode
+    if ($rc) {
+        throw "Cloudbase-Init installer exited with code $rc"
     }
 
     Step 'Configure Cloudbase-Init for CloudStack metadata'
