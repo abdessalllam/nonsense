@@ -28,7 +28,8 @@ function Step { param([string]$m) ; Write-Host ">> $m" }
 
 # ---------- 1. optimise OS ----------
 function Optimize-OS {
-    Step 'Power plan → Balanced';  powercfg /setactive SCHEME_BALANCED |Out-Null
+    Step 'Balanced power plan'
+    powercfg /setactive SCHEME_BALANCED | Out-Null
 
     Step 'Enable RDP + NLA + firewall'
     Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' fDenyTSConnections 0
@@ -37,11 +38,13 @@ function Optimize-OS {
     if ((Get-Service TermService).Status -ne 'Running') { Start-Service TermService }
     Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
 
-    Step 'TCP tuning (RSS on, autotune normal, chimney off)'
-    netsh interface tcp set global rss=enabled autotuninglevel=normal chimney=disabled |Out-Null
+    Step 'TCP global tweaks (best-effort – unsupported flags are ignored)'
+    foreach ($flag in @('rss=enabled','autotuninglevel=normal','chimney=disabled')) {
+        cmd /c "netsh interface tcp set global $flag >nul 2>nul"
+    }
 }
 
-# ---------- 2. fix pagefile ----------
+# ---------- 2. pagefile ----------
 function Fix-Pagefile {
     Step 'Pagefile → Automatic on C:'
     wmic computersystem where name="%COMPUTERNAME%" set AutomaticManagedPagefile=True  >$null 2>&1
@@ -59,53 +62,49 @@ function Cleanup-Windows {
     Remove-Item -Recurse -Force 'C:\Windows\SoftwareDistribution\Download\*' -ErrorAction SilentlyContinue
     Start-Service wuauserv
 
-    Step 'Trim WinSxS component store'
+    Step 'Trim WinSxS (modern builds only)'
     if ([Environment]::OSVersion.Version.Build -ge 14393) {
-        Dism.exe /online /Cleanup-Image /StartComponentCleanup /ResetBase |Out-Null
+        Dism.exe /online /Cleanup-Image /StartComponentCleanup /ResetBase | Out-Null
     }
 
-    Step 'Clear event logs (skip protected logs silently)'
-    foreach ($logName in & wevtutil el) {
-        & wevtutil cl "$logName" 1>$null 2>&1
-    }
+    Step 'Clear event logs (protected logs skipped silently)'
+    foreach ($logName in & wevtutil el) { & wevtutil cl "$logName" 1>$null 2>$null }
 }
 
-# ---------- 4. install VirtIO guest-tools ----------
+# ---------- 4. VirtIO guest-tools ----------
 function Install-VirtioDrivers {
     if (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
         Where-Object { $_.DisplayName -match 'VirtIO.*Guest.*Tools' }) {
         Step 'VirtIO Guest-Tools already installed – skipping';  return
     }
 
-    Step 'Downloading VirtIO Guest-Tools 0.1.271'
+    Step 'Download VirtIO Guest-Tools 0.1.271'
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     $arch = if ([Environment]::Is64BitOperatingSystem) { 'x64' } else { 'x86' }
     $msi  = "$env:TEMP\virtio-gt-$arch.msi"
-
     $url1 = "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/virtio-win-0.1.271-1/virtio-win-gt-$arch.msi"
-    $url2 = "https://fedora-virt.repo.nfrance.com/virtio-win/direct-downloads/stable-virtio/virtio-win-gt-$arch.msi"
+    $url2 = "https://fedora-virt.repo.nfrance.com/virtio-win/direct-downloads/stable-virtio/virtio-win-gt-$arch.msi"   # mirror
 
     try   { Invoke-WebRequest $url1 -OutFile $msi -UseBasicParsing -ErrorAction Stop }
     catch { Step 'Primary mirror failed – using mirror 2'
             Invoke-WebRequest $url2 -OutFile $msi -UseBasicParsing }
 
-    Step 'Installing VirtIO Guest-Tools silently'
+    Step 'Install VirtIO Guest-Tools silently'
     $rc = (Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -PassThru).ExitCode
     if ($rc) { throw "VirtIO installer exited with code $rc" }
     Step 'VirtIO Guest-Tools installed.'
 }
 
-# ---------- 5. install Cloud-Init ----------
+# ---------- 5. Cloud-Init ----------
 function Install-CloudInit {
     if (Get-Service cloudbase-init -ErrorAction SilentlyContinue) {
         Step 'Cloudbase-Init already installed – skipping';  return
     }
 
-    Step 'Downloading Cloudbase-Init MSI'
+    Step 'Download Cloudbase-Init MSI'
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     $arch = if ([Environment]::Is64BitOperatingSystem) { 'x64' } else { 'x86' }
     $msi  = "$env:TEMP\CloudbaseInit_$arch.msi"
-
     $pri  = "https://www.cloudbase.it/downloads/CloudbaseInitSetup_Stable_${arch}.msi"
     $bak  = "https://github.com/cloudbase/cloudbase-init/releases/latest/download/CloudbaseInitSetup_${arch}.msi"
 
@@ -113,12 +112,12 @@ function Install-CloudInit {
     catch { Step 'Primary mirror failed – using GitHub'
             Invoke-WebRequest $bak -OutFile $msi -UseBasicParsing }
 
-    Step 'Installing Cloudbase-Init silently'
+    Step 'Install Cloudbase-Init silently'
     $rc = (Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart RUN_CLOUDBASEINIT_SERVICE=1 SYSPREP_DISABLED=1" `
           -Wait -PassThru).ExitCode
     if ($rc) { throw "Cloudbase-Init installer exited with code $rc" }
 
-    Step 'Configuring Cloudbase-Init for CloudStack'
+    Step 'Configure Cloudbase-Init for CloudStack'
     $conf = "$env:ProgramFiles\Cloudbase Solutions\Cloudbase-Init\conf\cloudbase-init.conf"
 @'
 [DEFAULT]
@@ -134,7 +133,7 @@ plugins               = cloudbaseinit.plugins.common.setuserpassword.SetUserPass
     Step 'Cloudbase-Init ready.'
 }
 
-# ---------- 6. unattend.xml (keeps VirtIO after sysprep) ----------
+# ---------- 6. unattend.xml ----------
 function Write-Unattend {
     Step 'Writing C:\unattend.xml'
 @'
@@ -153,7 +152,7 @@ function Write-Unattend {
 '@ | Out-File 'C:\unattend.xml' -Encoding UTF8 -Force
 }
 
-# ---------- 7. run everything ----------
+# ---------- 7. execute ----------
 try {
     Optimize-OS
     Fix-Pagefile
@@ -161,10 +160,9 @@ try {
     Install-VirtioDrivers
     Install-CloudInit
     Write-Unattend
-    Step '✔ All steps completed – reboot, then sysprep with C:\unattend.xml when ready.'
+    Step '✔ Preparation complete — reboot, then sysprep with C:\unattend.xml when ready.'
 } catch {
-    Write-Error "ERROR: $($_.Exception.Message)"
-    Exit 1
+    Write-Error "ERROR: $($_.Exception.Message)";  Exit 1
 } finally {
     Stop-Transcript
     Write-Host "Log saved to $log"
