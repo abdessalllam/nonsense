@@ -44,8 +44,8 @@ function Optimize-OS {
 # ─────────────────── 2. PAGEFILE FIX ──────────────────────
 function Fix-Pagefile {
     Step 'Pagefile → Automatic on C:'
-    $null = wmic computersystem where name="%COMPUTERNAME%" set AutomaticManagedPagefile=True 2>&1
-    $null = wmic pagefileset where "name!='C:\\pagefile.sys'" delete 2>&1
+    wmic computersystem where name=`"%COMPUTERNAME%`" set AutomaticManagedPagefile=True >$null 2>&1
+    wmic pagefileset where `"name!='C:\\\\pagefile.sys'`" delete >$null 2>&1
 }
 
 # ─────────────────── 3. WINDOWS CLEAN-UP ──────────────────
