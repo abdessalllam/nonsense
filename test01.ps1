@@ -275,10 +275,10 @@ try {
     
     Optimize-OS
     Fix-Pagefile
-    Cleanup-Windows
     Install-VirtioDrivers
     Install-CloudInit
     Write-Unattend
+    Cleanup-Windows
     
     Write-Host ""
     Write-Host "=== CloudStack Windows Guest Preparation Complete ===" -ForegroundColor Green
