@@ -11,7 +11,7 @@
 #>
 
 # LOGGING
-$log = 'C:\cloudstack-prep.log'
+$log = 'C:\Users\Administrator\Downloads\cloudstack-prep.log'
 try { 
     Start-Transcript -Path $log -Append 
 }
