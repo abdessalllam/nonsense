@@ -296,4 +296,5 @@ catch {
 finally {
     Stop-Transcript
     Write-Host "Log saved to: $log" -ForegroundColor Gray
+    Write-Host "Don't forget to delete that as well and clearing powershell`s history before creating a template" -ForegroundColor Green
 }
