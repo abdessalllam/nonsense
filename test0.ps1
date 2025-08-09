@@ -53,11 +53,11 @@ if (-not (Test-IsAdmin)) {
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$log = 'C:\cloudstack-prep.log'
+$log = 'C:\Users\Administrator\Downloads\cloudstack-prep.log'
 $transcriptStarted = $false
 try { Start-Transcript -Path $log -Append | Out-Null; $transcriptStarted = $true } catch {
     $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-    try { Start-Transcript -Path "C:\cloudstack-prep_$timestamp.log" -Append | Out-Null; $transcriptStarted = $true } catch {}
+    try { Start-Transcript -Path "C:\Users\Administrator\Downloads\cloudstack-prep_$timestamp.log" -Append | Out-Null; $transcriptStarted = $true } catch {}
 }
 
 function Step([string]$m) { Write-Host ">> $m" -ForegroundColor Cyan }
