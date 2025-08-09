@@ -6,12 +6,11 @@
     Safe to re-run. Logs to C:\cloudstack-prep.log
 
     Key goals:
-      • Cloudbase-Init service starts at boot, pre-logon, with restart-on-failure
-      • RDP/TermService enabled with NLA + firewall opened
-      • VirtIO Guest Tools installed and QEMU-GA service started
-      • OS waits for network at startup (prevents metadata race)
+      • Cloudbase-Init service starts at boot (pre-logon), restart-on-failure
+      • RDP enabled with NLA + firewall opened (without altering service dependencies)
+      • VirtIO Guest Tools installed; QEMU-GA started
+      • OS waits for network at startup
       • Unattend.xml persists drivers through sysprep
-      • Works on Windows Server 2016, 2019, 2022, 2025 (Desktop or Core)
 #>
 
 # ------------------------ Parameters (must be first) ---------------------------
@@ -30,7 +29,6 @@ function Test-IsAdmin {
 if (-not (Test-IsAdmin)) {
     Write-Host "Elevation required. Relaunching as Administrator..." -ForegroundColor Yellow
     $argList = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"")
-    # Pass named parameters through
     if ($PSBoundParameters.ContainsKey('CloudUser')) { $argList += @('-CloudUser', $CloudUser) }
     if ($PSBoundParameters.ContainsKey('SkipVirtIO')) { $argList += '-SkipVirtIO' }
     if ($PSBoundParameters.ContainsKey('SkipCloudbaseInit')) { $argList += '-SkipCloudbaseInit' }
@@ -67,7 +65,6 @@ function Step([string]$m) { Write-Host ">> $m" -ForegroundColor Cyan }
 try { Import-Module Microsoft.PowerShell.LocalAccounts -ErrorAction SilentlyContinue } catch {}
 
 # ------------------------ Helpers ---------------------------------------------
-
 function Ensure-ServiceAutoStart {
     param(
         [Parameter(Mandatory)] [string]$Name,
@@ -80,11 +77,9 @@ function Ensure-ServiceAutoStart {
 
         $reg = "HKLM:\SYSTEM\CurrentControlSet\Services\$Name"
         New-Item -Path $reg -Force | Out-Null
-        # Ensure not delayed-start
         New-ItemProperty -Path $reg -Name 'DelayedAutoStart' -Value 0 -PropertyType DWord -Force | Out-Null
 
         if ($DependsOn -and $DependsOn.Count -gt 0) {
-            # Merge with existing dependencies instead of overwriting
             $existing = (Get-ItemProperty -Path $reg -Name 'DependOnService' -ErrorAction SilentlyContinue).DependOnService
             if ($existing -is [string]) { $existing = @($existing) }
             if (-not $existing) { $existing = @() }
@@ -98,18 +93,24 @@ function Ensure-ServiceAutoStart {
     }
 }
 
-
 # ------------------------ OS Optimisation -------------------------------------
 function Optimize-OS {
     Step 'Enable RDP + NLA and open firewall'
     New-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -PropertyType DWord -Force | Out-Null
     New-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 1 -PropertyType DWord -Force | Out-Null
-    # Ensure TermService starts and has sensible deps; include UmRdpService if present
-    $termDepends = @('nsi','Tcpip')
-    $um = Get-Service -Name 'UmRdpService' -ErrorAction SilentlyContinue
-    if ($um) { $termDepends += 'UmRdpService' }
-    Ensure-ServiceAutoStart -Name 'TermService' -DependsOn $termDepends
-    try { Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction Stop | Out-Null } catch {}
+
+    # Keep TermService defaults; do NOT alter dependencies to avoid platform quirks
+    try { & sc.exe config TermService start= auto | Out-Null } catch {}
+    try { Start-Service -Name TermService -ErrorAction SilentlyContinue } catch {}
+
+    # Firewall: first try DisplayGroup, then exact rule names (TCP/UDP)
+    $enabled = $false
+    try { Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction Stop | Out-Null; $enabled = $true } catch {}
+    if (-not $enabled) {
+        foreach ($rule in @('RemoteDesktop-UserMode-In-TCP','RemoteDesktop-UserMode-In-UDP')) {
+            try { Enable-NetFirewallRule -Name $rule -ErrorAction SilentlyContinue | Out-Null } catch {}
+        }
+    }
 
     Step 'Wait for network at startup (pre-logon)'
     New-Item -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\CurrentVersion\Winlogon' -Force | Out-Null
@@ -144,7 +145,6 @@ function Safe-Cleanup {
 }
 
 # ------------------------ VirtIO Guest Tools ----------------------------------
-
 function Install-VirtIO {
     if ($SkipVirtIO) { Step 'Skip VirtIO (requested)'; return }
     Step 'Install VirtIO Guest Tools'
@@ -182,7 +182,6 @@ function Install-VirtIO {
         Ensure-ServiceAutoStart -Name $svcName -DependsOn @('nsi','Tcpip')
     }
 }
-
 
 # ------------------------ Cloudbase-Init --------------------------------------
 function Install-CloudbaseInit {
@@ -237,9 +236,7 @@ function Install-CloudbaseInit {
         'cloudbaseinit.plugins.common.localscripts.LocalScriptsPlugin'
     ) -join ','
 
-    $metadataServices = @(
-        'cloudbaseinit.metadata.services.cloudstack.CloudStack'
-    ) -join ','
+    $metadataServices = @('cloudbaseinit.metadata.services.cloudstack.CloudStack') -join ','
 
     $conf = @"
 [DEFAULT]
@@ -285,19 +282,21 @@ function Write-Unattend {
 function Prepare-LocalAccount {
     Step "Ensure '$CloudUser' exists and is enabled"
     try {
-        $u = Get-LocalUser -Name $CloudUser -ErrorAction SilentlyContinue
-        if (-not $u) {
-            # For built-in Administrator this will throw; caught below.
-            New-LocalUser -Name $CloudUser -NoPassword -AccountNeverExpires -UserMayNotChangePassword:$false -ErrorAction Stop | Out-Null
-        } else {
-            try { Enable-LocalUser -Name $CloudUser -ErrorAction SilentlyContinue } catch {}
+        # Skip creation if CloudUser is the built-in Administrator
+        if ($CloudUser -ne 'Administrator') {
+            $u = Get-LocalUser -Name $CloudUser -ErrorAction SilentlyContinue
+            if (-not $u) {
+                New-LocalUser -Name $CloudUser -NoPassword -AccountNeverExpires -UserMayNotChangePassword:$false -ErrorAction Stop | Out-Null
+            } else {
+                try { Enable-LocalUser -Name $CloudUser -ErrorAction SilentlyContinue } catch {}
+            }
+            try {
+                Add-LocalGroupMember -Group 'Administrators' -Member $CloudUser -ErrorAction SilentlyContinue
+                Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $CloudUser -ErrorAction SilentlyContinue
+            } catch {}
         }
-        try {
-            Add-LocalGroupMember -Group 'Administrators' -Member $CloudUser -ErrorAction SilentlyContinue
-            Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $CloudUser -ErrorAction SilentlyContinue
-        } catch {}
     } catch {
-        Write-Verbose "Could not create local user '$CloudUser' (likely built-in Administrator). Continuing."
+        Write-Verbose "Local account handling skipped or failed for '$CloudUser'. Continuing."
     }
 }
 
