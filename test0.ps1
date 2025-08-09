@@ -1,276 +1,319 @@
-#requires -RunAsAdministrator
+#requires -Version 5.1
 <#
-  PREPARES a Windows guest for Apache CloudStack 4.20
-    - Optimise power, RDP, basic TCP
-    - Pagefile automatic (WMIC, widest compatibility)
-    - Deep-clean TEMP, event-logs, WinSxS, WU cache
-    - Install VirtIO Guest-Tools 0.1.271 (x86 / x64)
-    - Install & configure Cloudbase-Init for CloudStack password injection
-    - Write C:\unattend.xml (keeps VirtIO drivers after Sysprep)
-    - Fully idempotent safe to re-run
+    CloudStack Windows Template Prep (Server 2016 → 2025)
+    ----------------------------------------------------
+    Run as: Administrator (auto-elevates if needed)
+    Safe to re-run. Logs to C:\cloudstack-prep.log
+
+    Key goals:
+      • Cloudbase-Init service starts at boot, pre-logon, with restart-on-failure
+      • RDP/TermService enabled with NLA + firewall opened
+      • VirtIO Guest Tools installed and QEMU-GA service started
+      • OS waits for network at startup (prevents metadata race)
+      • Unattend.xml persists drivers through sysprep
+      • Works on Windows Server 2016, 2019, 2022, 2025 (Desktop or Core)
 #>
 
-# LOGGING
+# ------------------------ Parameters (must be first) ---------------------------
+param(
+    [string]$CloudUser = 'Administrator',     # account to receive password injection
+    [switch]$SkipVirtIO,
+    [switch]$SkipCloudbaseInit
+)
+
+# ------------------------ Self-elevate if not Admin ---------------------------
+function Test-IsAdmin {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $p  = New-Object Security.Principal.WindowsPrincipal($id)
+    return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+if (-not (Test-IsAdmin)) {
+    Write-Host "Elevation required. Relaunching as Administrator..." -ForegroundColor Yellow
+    $argList = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"")
+    # Pass named parameters through
+    if ($PSBoundParameters.ContainsKey('CloudUser')) { $argList += @('-CloudUser', $CloudUser) }
+    if ($PSBoundParameters.ContainsKey('SkipVirtIO')) { $argList += '-SkipVirtIO' }
+    if ($PSBoundParameters.ContainsKey('SkipCloudbaseInit')) { $argList += '-SkipCloudbaseInit' }
+    $psi = New-Object System.Diagnostics.ProcessStartInfo "powershell"
+    $psi.Arguments = $argList -join ' '
+    $psi.Verb = "RunAs"
+    try {
+        $p = [System.Diagnostics.Process]::Start($psi)
+        if ($p) { exit }
+    } catch {
+        Write-Error "User declined elevation. Exiting."
+        exit 1
+    }
+}
+
+# ------------------------ Hardening defaults ----------------------------------
+$ErrorActionPreference = 'Stop'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
 $log = 'C:\cloudstack-prep.log'
-try { 
-    Start-Transcript -Path $log -Append 
-}
-catch { 
-    $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-    $log = "C:\cloudstack-prep_$timestamp.log"
-    Start-Transcript -Path $log -Append 
-}
-
-function Step { 
-    param([string]$m) 
-    Write-Host ">> $m" -ForegroundColor Cyan 
-}
-
-# 1. OS OPTIMISATION
-function Optimize-OS {
-    Step 'Balanced power plan'
-    powercfg /setactive SCHEME_BALANCED | Out-Null
-
-    Step 'Enable RDP + NLA + firewall'
-    Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
-    Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 1
-    Set-Service TermService -StartupType Automatic
-    $rdpService = Get-Service TermService
-    if ($rdpService.Status -ne 'Running') { 
-        Start-Service TermService 
-    }
-    Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
-
-    Step 'TCP global flags (best-effort unsupported ones ignored)'
-    $tcpFlags = 'rss=enabled', 'autotuninglevel=normal', 'chimney=disabled'
-    foreach ($flag in $tcpFlags) {
-        $cmd = "netsh interface tcp set global $flag"
-        cmd /c "$cmd >nul 2>nul"
-    }
-}
-
-# 2. PAGEFILE FIX
-function Fix-Pagefile {
-    Step 'Pagefile Automatic on C:'
-    $wmicCmd1 = "wmic computersystem where name='%COMPUTERNAME%' set AutomaticManagedPagefile=True"
-    cmd /c "$wmicCmd1 >nul 2>&1"
-    $wmicCmd2 = "wmic pagefileset where `"name!='C:\\pagefile.sys'`" delete"
-    cmd /c "$wmicCmd2 >nul 2>&1"
-}
-
-# 3. WINDOWS CLEAN-UP
-function Cleanup-Windows {
-    Step 'Flush TEMP folders'
-    $tempFolders = "$env:TEMP", "C:\Windows\Temp"
-    foreach ($folder in $tempFolders) {
-        if (Test-Path $folder) {
-            Get-ChildItem $folder -Recurse -Force -ErrorAction SilentlyContinue |
-                Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-        }
-    }
-
-    Step 'Flush Windows Update download cache'
-    Stop-Service wuauserv -Force -ErrorAction SilentlyContinue
-    $wuPath = 'C:\Windows\SoftwareDistribution\Download'
-    if (Test-Path $wuPath) {
-        Remove-Item -Recurse -Force "$wuPath\*" -ErrorAction SilentlyContinue
-    }
-    Start-Service wuauserv -ErrorAction SilentlyContinue
-
-    Step 'Trim WinSxS (modern builds only)'
-    $buildNumber = [Environment]::OSVersion.Version.Build
-    if ($buildNumber -ge 14393) {
-        Dism.exe /online /Cleanup-Image /StartComponentCleanup /ResetBase | Out-Null
-    }
-
-    Step 'Clear event logs protected logs silently skipped'
-    $allLogs = wevtutil el
-    foreach ($logName in $allLogs) { 
-        $clearCmd = "wevtutil cl `"$logName`""
-        cmd /c "$clearCmd 2>nul"
-    }
-}
-
-# 4. VIRTIO 0.1.271
-function Install-VirtioDrivers {
-    $uninstallPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
-    $installed = Get-ItemProperty $uninstallPath -ErrorAction SilentlyContinue |
-        Where-Object { $_.DisplayName -match 'VirtIO.*Guest.*Tools' }
-    
-    if ($installed) {
-        Step 'VirtIO Guest-Tools already installed skipping'
-        return
-    }
-
-    Step 'Download VirtIO Guest-Tools 0.1.271'
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    
-    if ([Environment]::Is64BitOperatingSystem) { 
-        $arch = 'x64' 
-    } else { 
-        $arch = 'x86' 
-    }
-    
-    $msiPath = "$env:TEMP\virtio-gt-$arch.msi"
-    $baseUrl = 'https://fedorapeople.org/groups/virt/virtio-win/direct-downloads'
-    $url1 = "$baseUrl/archive-virtio/virtio-win-0.1.271-1/virtio-win-gt-$arch.msi"
-    $url2 = "https://fedora-virt.repo.nfrance.com/virtio-win/direct-downloads/stable-virtio/virtio-win-gt-$arch.msi"
-
-    try {
-        Invoke-WebRequest $url1 -OutFile $msiPath -UseBasicParsing -ErrorAction Stop
-    }
-    catch {
-        Step 'Primary mirror failed trying alternate mirror'
-        try {
-            Invoke-WebRequest $url2 -OutFile $msiPath -UseBasicParsing -ErrorAction Stop
-        }
-        catch {
-            throw "Failed to download VirtIO drivers from both mirrors"
-        }
-    }
-
-    Step 'Install VirtIO Guest-Tools silently'
-    $msiArgs = "/i", "`"$msiPath`"", "/qn", "/norestart"
-    $proc = Start-Process msiexec.exe -ArgumentList $msiArgs -Wait -PassThru
-    $exitCode = $proc.ExitCode
-    if ($exitCode -ne 0) { 
-        throw "VirtIO installer exited with code $exitCode" 
-    }
-    Step 'VirtIO Guest-Tools installed successfully'
-}
-
-# 5. CLOUDBASE-INIT
-function Install-CloudInit {
-    $svcExists = $null
-    try {
-        $svcExists = Get-Service cloudbase-init -ErrorAction Stop
-    }
-    catch {
-        # Service does not exist, continue
-    }
-    
-    if ($svcExists) {
-        Step 'Cloudbase-Init already installed skipping'
-        return
-    }
-
-    Step 'Download Cloudbase-Init MSI'
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    
-    if ([Environment]::Is64BitOperatingSystem) { 
-        $arch = 'x64' 
-    } else { 
-        $arch = 'x86' 
-    }
-    
-    $msiPath = "$env:TEMP\CloudbaseInit_$arch.msi"
-    $cbUrl1 = "https://www.cloudbase.it/downloads/CloudbaseInitSetup_Stable_$arch.msi"
-    $cbUrl2 = "https://github.com/cloudbase/cloudbase-init/releases/latest/download/CloudbaseInitSetup_$arch.msi"
-
-    try {
-        Invoke-WebRequest $cbUrl1 -OutFile $msiPath -UseBasicParsing -ErrorAction Stop
-    }
-    catch {
-        Step 'Primary mirror failed trying GitHub'
-        try {
-            Invoke-WebRequest $cbUrl2 -OutFile $msiPath -UseBasicParsing -ErrorAction Stop
-        }
-        catch {
-            throw "Failed to download Cloudbase-Init from both sources"
-        }
-    }
-
-    Step 'Install Cloudbase-Init silently'
-    $cbArgs = "/i", "`"$msiPath`"", "/qn", "/norestart", "RUN_CLOUDBASEINIT_SERVICE=1", "SYSPREP_DISABLED=1"
-    $proc = Start-Process msiexec.exe -ArgumentList $cbArgs -Wait -PassThru
-    $exitCode = $proc.ExitCode
-    if ($exitCode -ne 0) {
-        throw "Cloudbase-Init installer exited with code $exitCode"
-    }
-
-    Step 'Configure Cloudbase-Init for CloudStack metadata'
-    $cbDir = "$env:ProgramFiles\Cloudbase Solutions\Cloudbase-Init\conf"
-    $cbConf = "$cbDir\cloudbase-init.conf"
-    
-    if (!(Test-Path $cbDir)) {
-        New-Item -ItemType Directory -Path $cbDir -Force | Out-Null
-    }
-    
-    # Create config content as array of lines
-    $configLines = @(
-        '[DEFAULT]',
-        'username              = Administrator',
-        'inject_user_password  = true',
-        'first_logon_behaviour = no',
-        'metadata_services     = cloudbaseinit.metadata.services.cloudstack.CloudStack',
-        'plugins               = cloudbaseinit.plugins.common.setuserpassword.SetUserPasswordPlugin,cloudbaseinit.plugins.common.networkconfig.NetworkConfigPlugin,cloudbaseinit.plugins.common.sethostname.SetHostNamePlugin,cloudbaseinit.plugins.common.userdata.UserDataPlugin'
-    )
-    
-    # Write config file
-    $configLines | Out-File -FilePath $cbConf -Encoding ASCII -Force
-
-    Set-Service cloudbase-init -StartupType Automatic
-    Start-Service cloudbase-init -ErrorAction SilentlyContinue
-    Step 'Cloudbase-Init configured and ready'
-}
-
-# 6. UNATTEND.XML
-function Write-Unattend {
-    Step 'Write unattend.xml (preserves VirtIO after Sysprep)'
-    
-    if ([Environment]::Is64BitOperatingSystem) { 
-        $cpuArch = 'amd64' 
-    } else { 
-        $cpuArch = 'x86' 
-    }
-    
-    # Build XML line by line to avoid here-string issues
-    $xmlLines = @(
-        '<?xml version="1.0" encoding="utf-8"?>',
-        '<unattend xmlns="urn:schemas-microsoft-com:unattend">',
-        '  <settings pass="generalize">',
-        '    <component name="Microsoft-Windows-PnpSysprep"',
-        "               processorArchitecture=`"$cpuArch`"",
-        '               publicKeyToken="31bf3856ad364e35"',
-        '               versionScope="nonSxS"',
-        '               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">',
-        '      <PersistAllDeviceInstalls>true</PersistAllDeviceInstalls>',
-        '    </component>',
-        '  </settings>',
-        '</unattend>'
-    )
-    
-    # Write XML file
-    $xmlLines | Out-File -FilePath 'C:\unattend.xml' -Encoding UTF8 -Force
-}
-
-# 7. MAIN EXECUTION
+$transcriptStarted = $false
 try {
-    Write-Host ""
-    Write-Host "=== CloudStack Windows Guest Preparation Starting ===" -ForegroundColor Green
-    Write-Host ""
-    
+    Start-Transcript -Path $log -Append | Out-Null
+    $transcriptStarted = $true
+} catch {
+    $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    try {
+        Start-Transcript -Path "C:\cloudstack-prep_$timestamp.log" -Append | Out-Null
+        $transcriptStarted = $true
+    } catch {}
+}
+
+function Step([string]$m) { Write-Host ">> $m" -ForegroundColor Cyan }
+
+# ------------------------ Helpers ---------------------------------------------
+function Ensure-ServiceAutoStart {
+    param(
+        [Parameter(Mandatory)] [string]$Name,
+        [string[]]$DependsOn
+    )
+    try {
+        $svc = Get-Service -Name $Name -ErrorAction Stop
+        Set-Service -Name $Name -StartupType Automatic
+        if ($svc.Status -ne 'Running') { Start-Service -Name $Name -ErrorAction SilentlyContinue }
+
+        if ($DependsOn -and $DependsOn.Count -gt 0) {
+            $reg = "HKLM:\SYSTEM\CurrentControlSet\Services\$Name"
+            New-Item -Path $reg -Force | Out-Null
+            # Merge with existing dependencies instead of overwriting
+            $existing = (Get-ItemProperty -Path $reg -Name 'DependOnService' -ErrorAction SilentlyContinue).DependOnService
+            if ($existing -is [string]) { $existing = @($existing) }
+            if (-not $existing) { $existing = @() }
+            $merged = ($existing + $DependsOn) | Where-Object { $_ } | Select-Object -Unique
+            if ($merged.Count -gt 0) {
+                New-ItemProperty -Path $reg -Name 'DependOnService' -Value $merged -PropertyType MultiString -Force | Out-Null
+            }
+        }
+    } catch {
+        Write-Warning "Service $Name not found or could not be configured: $($_.Exception.Message)"
+    }
+}
+
+# ------------------------ OS Optimisation -------------------------------------
+function Optimize-OS {
+    Step 'Enable RDP + NLA and open firewall'
+    New-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -PropertyType DWord -Force | Out-Null
+    New-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 1 -PropertyType DWord -Force | Out-Null
+    # Ensure TermService starts and has sensible deps; include UmRdpService if present
+    $termDepends = @('nsi','Tcpip')
+    $um = Get-Service -Name 'UmRdpService' -ErrorAction SilentlyContinue
+    if ($um) { $termDepends += 'UmRdpService' }
+    Ensure-ServiceAutoStart -Name 'TermService' -DependsOn $termDepends
+    try { Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction Stop | Out-Null } catch {}
+
+    Step 'Wait for network at startup (pre-logon)'
+    New-Item -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\CurrentVersion\Winlogon' -Force | Out-Null
+    New-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\CurrentVersion\Winlogon' -Name 'SyncForegroundPolicy' -Value 1 -PropertyType DWord -Force | Out-Null
+}
+
+# ------------------------ Pagefile --------------------------------------------
+function Fix-Pagefile {
+    Step 'Set pagefile: system-managed'
+    $cs = Get-WmiObject -Class Win32_ComputerSystem
+    if ($cs.AutomaticManagedPagefile -ne $true) {
+        $cs.AutomaticManagedPagefile = $true
+        $cs.Put() | Out-Null
+    }
+}
+
+# ------------------------ Cleanup ---------------------------------------------
+function Safe-Cleanup {
+    Step 'Clean TEMP and Windows Update cache'
+    $targets = @("$env:TEMP","$env:WINDIR\Temp","C:\Windows\SoftwareDistribution\Download")
+    foreach ($t in $targets) {
+        if (Test-Path $t) {
+            Get-ChildItem -Path $t -Recurse -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    Step 'Clear Event Logs (non-critical)'
+    try { wevtutil el | ForEach-Object { try { wevtutil cl $_ } catch {} } } catch {}
+
+    Step 'Component cleanup (best-effort)'
+    try { DISM /Online /Cleanup-Image /StartComponentCleanup | Out-Null } catch {}
+}
+
+# ------------------------ VirtIO Guest Tools ----------------------------------
+function Install-VirtIO {
+    if ($SkipVirtIO) { Step 'Skip VirtIO (requested)'; return }
+    Step 'Install VirtIO Guest Tools'
+
+    $arch = if ([Environment]::Is64BitOperatingSystem) {'amd64'} else {'x86'}
+    $msiPath = "$env:TEMP\virtio-win-gt-$arch.msi"
+
+    $primaryUrl = "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/latest-virtio/virtio-win-gt-$arch.msi"
+    $backupUrl  = "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win-gt-$arch.msi"
+
+    $downloaded = $false
+    foreach ($u in @($primaryUrl,$backupUrl)) {
+        try {
+            Step "Downloading VirtIO from: $u"
+            Invoke-WebRequest -Uri $u -OutFile $msiPath -UseBasicParsing -ErrorAction Stop
+            $downloaded = $true
+            break
+        } catch {
+            Write-Warning "Download failed: $u"
+        }
+    }
+    if (-not $downloaded) { throw "VirtIO MSI not downloaded from any source." }
+
+    $args = "/i `"$msiPath`" /qn /norestart"
+    $p = Start-Process -FilePath msiexec.exe -ArgumentList $args -PassThru -Wait
+    if ($p.ExitCode -ne 0) { throw "VirtIO installer exit code: $($p.ExitCode)" }
+
+    # Ensure guest agent types are present and auto-started (names differ by build)
+    foreach ($svcName in @('QEMU-GA','qemu-ga')) {
+        Ensure-ServiceAutoStart -Name $svcName -DependsOn @('nsi','Tcpip')
+    }
+}
+
+# ------------------------ Cloudbase-Init --------------------------------------
+function Install-CloudbaseInit {
+    if ($SkipCloudbaseInit) { Step 'Skip Cloudbase-Init (requested)'; return }
+
+    Step 'Install Cloudbase-Init (stable)'
+    $arch = if ([Environment]::Is64BitOperatingSystem) {'x64'} else {'x86'}
+    $msiPath = "$env:TEMP\CloudbaseInit_$arch.msi"
+
+    $urls = @(
+        "https://github.com/cloudbase/cloudbase-init/releases/latest/download/CloudbaseInitSetup_$arch.msi",
+        "https://www.cloudbase.it/downloads/CloudbaseInitSetup_Stable_$arch.msi"
+    )
+
+    $downloaded = $false
+    foreach ($u in $urls) {
+        try {
+            Step "Downloading: $u"
+            Invoke-WebRequest -Uri $u -OutFile $msiPath -UseBasicParsing -ErrorAction Stop
+            $downloaded = $true; break
+        } catch {
+            Write-Warning "Download failed: $u"
+        }
+    }
+    if (-not $downloaded) { throw "Could not download Cloudbase-Init MSI." }
+
+    # Install as service, do not run sysprep automatically
+    $cbArgs = "/i `"$msiPath`" /qn /norestart RUN_CLOUDBASEINIT_SERVICE=1 SYSPREP_DISABLED=1"
+    $proc = Start-Process -FilePath msiexec.exe -ArgumentList $cbArgs -PassThru -Wait
+    if ($proc.ExitCode -ne 0) { throw "Cloudbase-Init installer exit code: $($proc.ExitCode)" }
+
+    # Configure Cloudbase-Init
+    Step 'Configure Cloudbase-Init for CloudStack password injection'
+    $cbRoot   = "${env:ProgramFiles}\Cloudbase Solutions\Cloudbase-Init"
+    $cbConfDir= Join-Path $cbRoot 'conf'
+    $cbConf   = Join-Path $cbConfDir 'cloudbase-init.conf'
+    if (-not (Test-Path $cbConfDir)) { New-Item -Path $cbConfDir -ItemType Directory -Force | Out-Null }
+
+    $plugins = @(
+        'cloudbaseinit.plugins.common.mtu.MTUPlugin',
+        'cloudbaseinit.plugins.windows.ntpclient.NTPClientPlugin',
+        'cloudbaseinit.plugins.common.sethostname.SetHostNamePlugin',
+        'cloudbaseinit.plugins.windows.createuser.CreateUserPlugin',
+        'cloudbaseinit.plugins.common.networkconfig.NetworkConfigPlugin',
+        'cloudbaseinit.plugins.windows.licensing.WindowsLicensingPlugin',
+        'cloudbaseinit.plugins.common.sshpublickeys.SetUserSSHPublicKeysPlugin',
+        'cloudbaseinit.plugins.windows.extendvolumes.ExtendVolumesPlugin',
+        'cloudbaseinit.plugins.common.userdata.UserDataPlugin',
+        'cloudbaseinit.plugins.common.setuserpassword.SetUserPasswordPlugin',
+        'cloudbaseinit.plugins.windows.winrmlistener.ConfigWinRMListenerPlugin',
+        'cloudbaseinit.plugins.windows.winrmcertificateauth.ConfigWinRMCertificateAuthPlugin',
+        'cloudbaseinit.plugins.common.localscripts.LocalScriptsPlugin'
+    ) -join ','
+
+    $metadataServices = @(
+        'cloudbaseinit.metadata.services.cloudstack.CloudStack'
+    ) -join ','
+
+    $conf = @"
+[DEFAULT]
+username = $CloudUser
+inject_user_password = true
+first_logon_behaviour = no
+metadata_services = $metadataServices
+plugins = $plugins
+process_userdata = true
+service_change_startup_type = true
+"@
+    $conf | Out-File -FilePath $cbConf -Encoding ASCII -Force
+
+    # Ensure the service is Automatic, started, with dependency on basic network
+    Ensure-ServiceAutoStart -Name 'cloudbase-init' -DependsOn @('nsi','Tcpip')
+    # Aggressive service recovery
+    cmd /c 'sc.exe failure "cloudbase-init" reset= 86400 actions= restart/5000/restart/5000/restart/5000' | Out-Null
+    cmd /c 'sc.exe failureflag "cloudbase-init" 1' | Out-Null
+}
+
+# ------------------------ Unattend.xml for Sysprep ----------------------------
+function Write-Unattend {
+    Step 'Write C:\unattend.xml (preserve VirtIO drivers)'
+    $cpuArch = if ([Environment]::Is64BitOperatingSystem) {'amd64'} else {'x86'}
+    $xml = @"
+<?xml version="1.0" encoding="utf-8"?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+  <settings pass="generalize">
+    <component name="Microsoft-Windows-PnpSysprep"
+               processorArchitecture="$cpuArch"
+               publicKeyToken="31bf3856ad364e35"
+               versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <PersistAllDeviceInstalls>true</PersistAllDeviceInstalls>
+    </component>
+  </settings>
+</unattend>
+"@
+    $xml | Out-File -FilePath 'C:\unattend.xml' -Encoding ASCII -Force
+}
+
+# ------------------------ Compatibility nudges --------------------------------
+function Prepare-LocalAccount {
+    Step "Ensure '$CloudUser' exists and is enabled"
+    try {
+        $u = Get-LocalUser -Name $CloudUser -ErrorAction SilentlyContinue
+        if (-not $u) {
+            # For built-in Administrator this will throw; caught below.
+            New-LocalUser -Name $CloudUser -NoPassword -AccountNeverExpires -UserMayNotChangePassword:$false -ErrorAction Stop | Out-Null
+        } else {
+            try { Enable-LocalUser -Name $CloudUser -ErrorAction SilentlyContinue } catch {}
+        }
+        try {
+            Add-LocalGroupMember -Group 'Administrators' -Member $CloudUser -ErrorAction SilentlyContinue
+            Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $CloudUser -ErrorAction SilentlyContinue
+        } catch {}
+    } catch {
+        Write-Verbose "Could not create local user '$CloudUser' (likely built-in Administrator). Continuing."
+    }
+}
+
+# ------------------------ Main ------------------------------------------------
+try {
+    Step 'Start: CloudStack Windows Template Prep'
     Optimize-OS
     Fix-Pagefile
-    Cleanup-Windows
-    Install-VirtioDrivers
-    Install-CloudInit
+    Prepare-LocalAccount
+    Install-VirtIO
+    Install-CloudbaseInit
     Write-Unattend
-    
-    Write-Host ""
-    Write-Host "=== CloudStack Windows Guest Preparation Complete ===" -ForegroundColor Green
-    Step 'Prep complete - reboot once, then sysprep with:'
-    Write-Host '   %windir%\System32\Sysprep\Sysprep.exe /generalize /oobe /shutdown /unattend:C:\unattend.xml' -ForegroundColor Yellow
-    Write-Host ""
-} 
+    Safe-Cleanup
+
+    Step 'Done. Next steps:'
+    Write-Host @"
+1) Optional: re-run with -CloudUser 'YourAdminUser' to target a different account.
+2) Seal the image (do not log in after sysprep):
+   C:\Windows\System32\Sysprep\sysprep.exe /generalize /oobe /shutdown /unattend:C:\unattend.xml
+3) Register as a template in CloudStack and set "Password Enabled" = Yes.
+"@ -ForegroundColor Yellow
+}
 catch {
     Write-Host ""
     Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
-    Write-Host "Stack Trace:" -ForegroundColor Red
-    Write-Host $_.ScriptStackTrace
+    Write-Host $_.ScriptStackTrace -ForegroundColor DarkGray
     exit 1
-} 
+}
 finally {
-    Stop-Transcript
+    if ($transcriptStarted) { try { Stop-Transcript | Out-Null } catch {} }
     Write-Host "Log saved to: $log" -ForegroundColor Gray
 }
