@@ -19,6 +19,7 @@ param(
     [string]$CloudbaseInitVersion = '1.1.6',
     [string]$CloudbaseInitMsiPath = '',
     [string]$VirtIOMsiPath = '',
+    [string]$VirtIOIsoDrive = '',  # e.g., 'E:' (mounted virtio-win ISO root)
     [switch]$SkipVirtIO,
     [switch]$SkipCloudbaseInit
 )
@@ -53,11 +54,11 @@ if (-not (Test-IsAdmin)) {
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$log = 'C:\Users\Administrator\Downloads\cloudstack-prep.log'
+$log = 'C:\cloudstack-prep.log'
 $transcriptStarted = $false
 try { Start-Transcript -Path $log -Append | Out-Null; $transcriptStarted = $true } catch {
     $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-    try { Start-Transcript -Path "C:\Users\Administrator\Downloads\cloudstack-prep_$timestamp.log" -Append | Out-Null; $transcriptStarted = $true } catch {}
+    try { Start-Transcript -Path "C:\cloudstack-prep_$timestamp.log" -Append | Out-Null; $transcriptStarted = $true } catch {}
 }
 
 function Step([string]$m) { Write-Host ">> $m" -ForegroundColor Cyan }
@@ -155,11 +156,11 @@ function Safe-Cleanup {
 }
 
 # ------------------------ VirtIO Guest Tools ----------------------------------
+
 function Install-VirtIO {
     if ($SkipVirtIO) { Step 'Skip VirtIO (requested)'; return }
-    Step 'Install VirtIO Guest Tools'
+    Step 'Install VirtIO Guest Tools (MSI) and QEMU-GA (if available)'
 
-    # VirtIO MSI uses x64/x86 naming
     $arch = if ([Environment]::Is64BitOperatingSystem) {'x64'} else {'x86'}
     $msiName = "virtio-win-gt-$arch.msi"
     $msiPath = if ($VirtIOMsiPath) { $VirtIOMsiPath } else { Join-Path $env:TEMP $msiName }
@@ -175,27 +176,68 @@ function Install-VirtIO {
                 Step "Downloading VirtIO from: $u"
                 Invoke-WebRequest -Uri $u -OutFile $msiPath -UseBasicParsing -ErrorAction Stop
                 $downloaded = $true; break
-            } catch { Write-Verbose "VirtIO download failed: $u" }
+            } catch {
+                Write-Verbose "VirtIO download failed: $u"
+            }
         }
         if (-not $downloaded) { throw "VirtIO MSI not downloaded from any source." }
     }
 
     if (-not (Test-Path $msiPath)) { throw "VirtIO MSI not found at $msiPath" }
-    $args = "/i `"$msiPath`" /qn /norestart"
+    # Install ALL features silently
+    $args = "/i `"$msiPath`" /qn /norestart ADDLOCAL=ALL"
     $p = Start-Process -FilePath msiexec.exe -ArgumentList $args -PassThru -Wait
     if ($p.ExitCode -ne 0) { throw "VirtIO installer exit code: $($p.ExitCode)" }
 
-    # Try to find and start any QEMU guest agent service if installed
-    $gaCandidates = @('QEMU-GA','qemu-ga')
-    $foundGA = $false
-    foreach ($svcName in $gaCandidates) {
-        if (Try-StartService -Name $svcName) { $foundGA = $true }
+    # If drivers still not visible, optionally stage from ISO using pnputil
+    $hasRedHatDrivers = $false
+    try {
+        $drivers = Get-WmiObject Win32_PnPSignedDriver | Where-Object { $_.DriverProviderName -like '*Red Hat*' -or $_.Manufacturer -like '*Red Hat*' }
+        if ($drivers) { $hasRedHatDrivers = $true }
+    } catch {}
+
+    if (-not $hasRedHatDrivers -and $VirtIOIsoDrive) {
+        Step "Staging VirtIO drivers via pnputil from $VirtIOIsoDrive (fallback)"
+        $infGlob = Join-Path "$VirtIOIsoDrive\" "*.inf"
+        try {
+            pnputil.exe /add-driver "$infGlob" /subdirs /install | Out-Null
+            # Recheck
+            $drivers = Get-WmiObject Win32_PnPSignedDriver | Where-Object { $_.DriverProviderName -like '*Red Hat*' -or $_.Manufacturer -like '*Red Hat*' }
+            if ($drivers) { $hasRedHatDrivers = $true }
+        } catch {
+            Write-Verbose "pnputil staging failed: $($_.Exception.Message)"
+        }
     }
-    if (-not $foundGA) {
-        $maybe = Get-Service | Where-Object { $_.DisplayName -match 'QEMU.*Agent' -or $_.Name -match 'qemu' } | Select-Object -First 1
-        if ($maybe) { Try-StartService -Name $maybe.Name | Out-Null }
+
+    # QEMU Guest Agent: try to start if installed; otherwise attempt from ISO if present
+    $gaSvcNames = @('QEMU-GA','qemu-ga')
+    $gaFound = $false
+    foreach ($svc in $gaSvcNames) {
+        $s = Get-Service -Name $svc -ErrorAction SilentlyContinue
+        if ($s) {
+            Ensure-ServiceAutoStart -Name $svc -DependsOn @('nsi','Tcpip')
+            $gaFound = $true
+        }
+    }
+
+    if (-not $gaFound -and $VirtIOIsoDrive) {
+        $gaMsi = Join-Path "$VirtIOIsoDrive\guest-agent" "qemu-ga-x86_64.msi"
+        if (Test-Path $gaMsi) {
+            Step "Installing QEMU Guest Agent from $gaMsi"
+            $gaArgs = "/i `"$gaMsi`" /qn /norestart"
+            $gp = Start-Process -FilePath msiexec.exe -ArgumentList $gaArgs -PassThru -Wait
+            if ($gp.ExitCode -eq 0) {
+                foreach ($svc in $gaSvcNames) {
+                    Ensure-ServiceAutoStart -Name $svc -DependsOn @('nsi','Tcpip')
+                }
+                $gaFound = $true
+            } else {
+                Write-Verbose "qemu-ga installer exit code: $($gp.ExitCode)"
+            }
+        }
     }
 }
+
 
 # ------------------------ Cloudbase-Init --------------------------------------
 function Install-CloudbaseInit {
@@ -266,6 +308,7 @@ service_change_startup_type = true
 }
 
 # ------------------------ Unattend.xml for Sysprep ----------------------------
+
 function Write-Unattend {
     Step 'Write C:\unattend.xml (preserve VirtIO drivers)'
     $cpuArch = if ([Environment]::Is64BitOperatingSystem) {'amd64'} else {'x86'}
@@ -276,19 +319,47 @@ function Write-Unattend {
     <component name="Microsoft-Windows-PnpSysprep"
                processorArchitecture="$cpuArch"
                publicKeyToken="31bf3856ad364e35"
+               language="neutral"
                versionScope="nonSxS"
                xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
       <PersistAllDeviceInstalls>true</PersistAllDeviceInstalls>
+      <DoNotCleanUpNonPresentDevices>true</DoNotCleanUpNonPresentDevices>
     </component>
   </settings>
 </unattend>
 "@
-    $xml | Out-File -FilePath 'C:\unattend.xml' -Encoding ASCII -Force
+    $path = 'C:\unattend.xml'
+    $xml | Out-File -FilePath $path -Encoding UTF8 -Force
 }
 
 
+
+
+# ------------------------ Unattend Validation ---------------------------------
+function Validate-Unattend {
+    Step 'Validation: Unattend XML structure'
+    $path = 'C:\unattend.xml'
+    if (-not (Test-Path $path)) {
+        Write-Host "unattend.xml missing at $path" -ForegroundColor Red
+        return
+    }
+    try {
+        [xml]$doc = Get-Content $path -Raw -Encoding UTF8
+        $ns = New-Object System.Xml.XmlNamespaceManager($doc.NameTable)
+        $ns.AddNamespace('u','urn:schemas-microsoft-com:unattend')
+        $ns.AddNamespace('wcm','http://schemas.microsoft.com/WMIConfig/2002/State')
+        $node = $doc.SelectSingleNode('/u:unattend/u:settings[@pass="generalize"]/u:component[@name="Microsoft-Windows-PnpSysprep"]', $ns)
+        if ($null -eq $node) {
+            Write-Host "PnPSysprep component not found under generalize!" -ForegroundColor Red
+        } else {
+            Write-Host "PnPSysprep component present under generalize." -ForegroundColor Green
+        }
+    } catch {
+        Write-Host "Failed to parse unattend.xml as XML: $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
 # ------------------------ Validation & Summary --------------------------------
-function Validate-PostSetup {
+function Validate-Unattend`n    Validate-PostSetup {
     Step 'Validation: RDP service and firewall'
     $rdpSvc = Get-Service TermService -ErrorAction SilentlyContinue
     if ($rdpSvc) {
