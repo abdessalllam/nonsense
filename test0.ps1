@@ -64,8 +64,10 @@ try {
 }
 
 function Step([string]$m) { Write-Host ">> $m" -ForegroundColor Cyan }
+try { Import-Module Microsoft.PowerShell.LocalAccounts -ErrorAction SilentlyContinue } catch {}
 
 # ------------------------ Helpers ---------------------------------------------
+
 function Ensure-ServiceAutoStart {
     param(
         [Parameter(Mandatory)] [string]$Name,
@@ -76,9 +78,12 @@ function Ensure-ServiceAutoStart {
         Set-Service -Name $Name -StartupType Automatic
         if ($svc.Status -ne 'Running') { Start-Service -Name $Name -ErrorAction SilentlyContinue }
 
+        $reg = "HKLM:\SYSTEM\CurrentControlSet\Services\$Name"
+        New-Item -Path $reg -Force | Out-Null
+        # Ensure not delayed-start
+        New-ItemProperty -Path $reg -Name 'DelayedAutoStart' -Value 0 -PropertyType DWord -Force | Out-Null
+
         if ($DependsOn -and $DependsOn.Count -gt 0) {
-            $reg = "HKLM:\SYSTEM\CurrentControlSet\Services\$Name"
-            New-Item -Path $reg -Force | Out-Null
             # Merge with existing dependencies instead of overwriting
             $existing = (Get-ItemProperty -Path $reg -Name 'DependOnService' -ErrorAction SilentlyContinue).DependOnService
             if ($existing -is [string]) { $existing = @($existing) }
@@ -92,6 +97,7 @@ function Ensure-ServiceAutoStart {
         Write-Warning "Service $Name not found or could not be configured: $($_.Exception.Message)"
     }
 }
+
 
 # ------------------------ OS Optimisation -------------------------------------
 function Optimize-OS {
@@ -138,38 +144,45 @@ function Safe-Cleanup {
 }
 
 # ------------------------ VirtIO Guest Tools ----------------------------------
+
 function Install-VirtIO {
     if ($SkipVirtIO) { Step 'Skip VirtIO (requested)'; return }
     Step 'Install VirtIO Guest Tools'
 
-    $arch = if ([Environment]::Is64BitOperatingSystem) {'amd64'} else {'x86'}
-    $msiPath = "$env:TEMP\virtio-win-gt-$arch.msi"
+    # VirtIO MSI uses x64/x86 naming, NOT amd64.
+    $arch = if ([Environment]::Is64BitOperatingSystem) {'x64'} else {'x86'}
+    $msiName = "virtio-win-gt-$arch.msi"
+    $msiPath = Join-Path $env:TEMP $msiName
 
-    $primaryUrl = "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/latest-virtio/virtio-win-gt-$arch.msi"
-    $backupUrl  = "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win-gt-$arch.msi"
+    $urls = @(
+        "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/latest-virtio/$msiName",
+        "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/$msiName"
+    )
 
     $downloaded = $false
-    foreach ($u in @($primaryUrl,$backupUrl)) {
+    foreach ($u in $urls) {
         try {
             Step "Downloading VirtIO from: $u"
             Invoke-WebRequest -Uri $u -OutFile $msiPath -UseBasicParsing -ErrorAction Stop
             $downloaded = $true
             break
         } catch {
-            Write-Warning "Download failed: $u"
+            Write-Warning "Download failed: $u (`$($_.Exception.Message)`)"
         }
     }
-    if (-not $downloaded) { throw "VirtIO MSI not downloaded from any source." }
+    if (-not $downloaded) {
+        throw "VirtIO MSI not downloaded from any source. Tried: $($urls -join ', ')"
+    }
 
     $args = "/i `"$msiPath`" /qn /norestart"
     $p = Start-Process -FilePath msiexec.exe -ArgumentList $args -PassThru -Wait
     if ($p.ExitCode -ne 0) { throw "VirtIO installer exit code: $($p.ExitCode)" }
 
-    # Ensure guest agent types are present and auto-started (names differ by build)
     foreach ($svcName in @('QEMU-GA','qemu-ga')) {
         Ensure-ServiceAutoStart -Name $svcName -DependsOn @('nsi','Tcpip')
     }
 }
+
 
 # ------------------------ Cloudbase-Init --------------------------------------
 function Install-CloudbaseInit {
