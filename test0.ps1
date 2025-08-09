@@ -75,7 +75,7 @@ try {
     Write-Warning "Could not set TLS 1.2. Downloads might fail on older systems."
 }
 
-$log = 'C:\cloudstack-prep.log'
+$log = 'C:\Users\Administrator\Downloads\cloudstack-prep.log'
 $transcriptStarted = $false
 
 # Try to start transcript
@@ -88,7 +88,7 @@ try {
     $transcriptStarted = $true 
 } catch {
     $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-    $altLog = "C:\cloudstack-prep_$timestamp.log"
+    $altLog = "C:\Users\Administrator\Downloads\cloudstack-prep_$timestamp.log"
     try { 
         Start-Transcript -Path $altLog -Append -ErrorAction Stop | Out-Null
         $transcriptStarted = $true
