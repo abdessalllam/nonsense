@@ -1,17 +1,18 @@
 #requires -Version 5.1
 <#
-    CloudStack Windows Template Prep (Server 2016 → 2025) — v13
-    -----------------------------------------------------------
-    • Forces 64‑bit, elevated PowerShell (self‑relaunch)
-    • Installs Cloudbase‑Init (as LocalSystem) and repairs broken service registrations
-    • Installs VirtIO guest tools silently (ADDLOCAL=ALL), with pnputil fallback and QEMU GA from ISO if needed
+    CloudStack Windows Template Prep (Server 2016 → 2025) — v12-precheck
+    --------------------------------------------------------------------
+    • Auto-elevates to Administrator (same bitness as caller)
+    • BEFORE installing, checks whether Cloudbase‑Init and VirtIO drivers are already present
+    • Installs VirtIO silently (MSI), optional pnputil fallback, and GA from ISO if available
+    • Installs Cloudbase‑Init (LocalSystem), repairs a broken service registration if needed
     • Enables RDP + NLA, opens firewall, waits for network at startup
     • Writes a safe unattend.xml to preserve drivers through sysprep
-    • Validates everything at the end; logs to C:\cloudstack-prep.log
+    • Validates at the end; logs to C:\cloudstack-prep.log
 
     Parameters:
-      -CloudUser 'Administrator'                  # target account for metadata password
-      -CloudbaseInitVersion '1.1.6'               # versioned GitHub release
+      -CloudUser 'Administrator'
+      -CloudbaseInitVersion '1.1.6'
       -CloudbaseInitMsiPath 'C:\path\CloudbaseInitSetup_1_1_6_x64.msi'   # offline
       -VirtIOMsiPath 'C:\path\virtio-win-gt-x64.msi'                     # offline
       -VirtIOIsoDrive 'E:'                        # mounted virtio ISO for pnputil & GA MSI fallback
@@ -28,21 +29,14 @@ param(
     [switch]$SkipCloudbaseInit
 )
 
-# ------------------------ Admin & 64-bit enforcement ---------------------------
+# ------------------------ Self-elevate if not Admin ---------------------------
 function Test-IsAdmin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     $p  = New-Object Security.Principal.WindowsPrincipal($id)
     return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
-function Assert-Admin {
-    if (-not (Test-IsAdmin)) { throw "This script must run as Administrator." }
-}
-# Relaunch as 64-bit, elevated PowerShell if needed
-$need64 = [Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess
-$needAdmin = -not (Test-IsAdmin)
-if ($need64 -or $needAdmin) {
-    $hostPs = if ($need64) { "$env:WINDIR\sysnative\WindowsPowerShell\v1.0\powershell.exe" } else { "powershell.exe" }
-    Write-Host "Relaunching as $([bool]$need64 ? '64-bit ' : '')Administrator..." -ForegroundColor Yellow
+if (-not (Test-IsAdmin)) {
+    Write-Host "Elevation required. Relaunching as Administrator..." -ForegroundColor Yellow
     $argList = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"")
     foreach ($k in $PSBoundParameters.Keys) {
         $val = $PSBoundParameters[$k]
@@ -53,16 +47,11 @@ if ($need64 -or $needAdmin) {
             $argList += @("-$k", $escaped)
         }
     }
-    $psi = New-Object System.Diagnostics.ProcessStartInfo $hostPs
+    $psi = New-Object System.Diagnostics.ProcessStartInfo "powershell"
     $psi.Arguments = ($argList -join ' ')
     $psi.Verb = "RunAs"
-    try { [System.Diagnostics.Process]::Start($psi) | Out-Null; exit } catch { throw "Elevation/64-bit relaunch cancelled." }
+    try { [System.Diagnostics.Process]::Start($psi) | Out-Null; exit } catch { Write-Error "User declined elevation. Exiting."; exit 1 }
 }
-Assert-Admin
-$Is64OS = [Environment]::Is64BitOperatingSystem
-$ProgramFilesPreferred = if ($Is64OS) { $env:ProgramW6432 } else { $env:ProgramFiles }
-$Msiexec = Join-Path $env:SystemRoot 'System32\msiexec.exe'
-$Pnputil = Join-Path $env:SystemRoot 'System32\pnputil.exe'
 
 # ------------------------ Hardening defaults ----------------------------------
 $ErrorActionPreference = 'Stop'
@@ -113,6 +102,46 @@ function Ensure-ServiceAutoStart {
     } catch {}
 }
 
+# ------------------------ Install Pre-checks -----------------------------------
+function Test-CloudbaseInitInstalled {
+    try {
+        $svc = Get-Service -Name 'cloudbase-init' -ErrorAction SilentlyContinue
+        if (-not $svc) { return $false }
+        $svcKey   = 'HKLM:\SYSTEM\CurrentControlSet\Services\cloudbase-init'
+        $image    = (Get-ItemProperty -Path $svcKey -Name ImagePath -ErrorAction SilentlyContinue).ImagePath
+        $roots    = @("${env:ProgramFiles}\Cloudbase Solutions\Cloudbase-Init")
+        if ($env:ProgramFiles -and $env:ProgramFiles -ne $env:ProgramFiles(x86)) {
+            $roots += "${env:ProgramFiles(x86)}\Cloudbase Solutions\Cloudbase-Init"
+        }
+        $binFound = $false
+        foreach ($r in $roots) {
+            if (Test-Path (Join-Path $r 'Python\Scripts\cloudbase-init.exe')) { $binFound = $true; break }
+            if (Test-Path (Join-Path $r 'bin\OpenStackService.exe')) { $binFound = $true; break }
+        }
+        return ([string]::IsNullOrWhiteSpace($image) -eq $false) -and $binFound
+    } catch { return $false }
+}
+
+function Test-VirtIODriversInstalled {
+    try {
+        $drivers = Get-WmiObject Win32_PnPSignedDriver | Where-Object { $_.DriverProviderName -like '*Red Hat*' -or $_.Manufacturer -like '*Red Hat*' }
+        if ($drivers) { return $true }
+    } catch {}
+    $svcNames = @('NetKVM','vioscsi','viostor','vioserial','vioinput','viorng','qemufwcfg','qemupciserial','pvpanic')
+    foreach ($n in $svcNames) {
+        if (Test-Path "HKLM:\SYSTEM\CurrentControlSet\Services\$n") { return $true }
+    }
+    return $false
+}
+
+function Test-QemuGAInstalled {
+    $ga = Get-Service -Name 'QEMU-GA' -ErrorAction SilentlyContinue
+    if ($ga) { return $true }
+    $ga = Get-Service -Name 'qemu-ga' -ErrorAction SilentlyContinue
+    if ($ga) { return $true }
+    return $false
+}
+
 # ------------------------ OS Optimisation -------------------------------------
 function Optimize-OS {
     Step 'Enable RDP + NLA and open firewall'
@@ -159,13 +188,27 @@ function Safe-Cleanup {
 # ------------------------ VirtIO Guest Tools ----------------------------------
 function Install-VirtIO {
     if ($SkipVirtIO) { Step 'Skip VirtIO (requested)'; return }
-    Step 'Install VirtIO Guest Tools (MSI) and QEMU-GA (if available)'
 
+    # Pre-checks
+    $driversPresent = Test-VirtIODriversInstalled
+    $gaPresent = Test-QemuGAInstalled
+    if ($driversPresent -and $gaPresent) {
+        Step 'VirtIO drivers and QEMU-GA already present; skipping install'
+        foreach ($svc in @('QEMU-GA','qemu-ga')) { Ensure-ServiceAutoStart -Name $svc -DependsOn @('nsi','Tcpip') }
+        return
+    }
+    $skipDriverMsi = $false
+    if ($driversPresent -and -not $gaPresent) {
+        Step 'VirtIO drivers detected; will attempt only QEMU-GA install (skip driver MSI)'
+        $skipDriverMsi = $true
+    }
+
+    Step 'Install VirtIO Guest Tools (MSI) and QEMU-GA (if available)'
     $arch = if ([Environment]::Is64BitOperatingSystem) {'x64'} else {'x86'}
     $msiName = "virtio-win-gt-$arch.msi"
     $msiPath = if ($VirtIOMsiPath) { $VirtIOMsiPath } else { Join-Path $env:TEMP $msiName }
 
-    if (-not $VirtIOMsiPath) {
+    if (-not $skipDriverMsi -and -not $VirtIOMsiPath) {
         $urls = @(
             "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/latest-virtio/$msiName",
             "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/$msiName"
@@ -177,26 +220,19 @@ function Install-VirtIO {
         if (-not $downloaded) { throw "VirtIO MSI not downloaded from any source." }
     }
 
-    if (-not (Test-Path $msiPath)) { throw "VirtIO MSI not found at $msiPath" }
-    $args = "/i `"$msiPath`" /qn /norestart ADDLOCAL=ALL /l*v C:\virtio-gt-install.log"
-    $p = Start-Process -FilePath $Msiexec -ArgumentList $args -PassThru -Wait
-    if ($p.ExitCode -ne 0) { throw "VirtIO installer exit code: $($p.ExitCode)" }
+    if ($skipDriverMsi -eq $false -and -not (Test-Path $msiPath)) { throw "VirtIO MSI not found at $msiPath" }
+    if (-not $skipDriverMsi) {
+        $args = "/i `"$msiPath`" /qn /norestart"
+        $p = Start-Process -FilePath msiexec.exe -ArgumentList $args -PassThru -Wait
+        if ($p.ExitCode -ne 0) { throw "VirtIO installer exit code: $($p.ExitCode)" }
+    }
 
-    # Stage drivers with pnputil from ISO if requested & still not visible
-    $hasRedHatDrivers = $false
-    try {
-        $drivers = Get-WmiObject Win32_PnPSignedDriver | Where-Object { $_.DriverProviderName -like '*Red Hat*' -or $_.Manufacturer -like '*Red Hat*' }
-        if ($drivers) { $hasRedHatDrivers = $true }
-    } catch {}
-
+    # If drivers still not visible and ISO provided, stage all drivers
+    $hasRedHatDrivers = Test-VirtIODriversInstalled
     if (-not $hasRedHatDrivers -and $VirtIOIsoDrive) {
         Step "Staging VirtIO drivers via pnputil from $VirtIOIsoDrive (fallback)"
         $infGlob = Join-Path "$VirtIOIsoDrive\" "*.inf"
-        try {
-            & $Pnputil /add-driver "$infGlob" /subdirs /install | Out-Null
-            $drivers = Get-WmiObject Win32_PnPSignedDriver | Where-Object { $_.DriverProviderName -like '*Red Hat*' -or $_.Manufacturer -like '*Red Hat*' }
-            if ($drivers) { $hasRedHatDrivers = $true }
-        } catch { Write-Verbose "pnputil staging failed: $($_.Exception.Message)" }
+        try { pnputil.exe /add-driver "$infGlob" /subdirs /install | Out-Null } catch { Write-Verbose "pnputil staging failed." }
     }
 
     # QEMU Guest Agent: try to start if installed; otherwise attempt from ISO if present
@@ -208,8 +244,8 @@ function Install-VirtIO {
         $gaMsi = Join-Path "$VirtIOIsoDrive\guest-agent" "qemu-ga-x86_64.msi"
         if (Test-Path $gaMsi) {
             Step "Installing QEMU Guest Agent from $gaMsi"
-            $gaArgs = "/i `"$gaMsi`" /qn /norestart /l*v C:\qemu-ga-install.log"
-            $gp = Start-Process -FilePath $Msiexec -ArgumentList $gaArgs -PassThru -Wait
+            $gaArgs = "/i `"$gaMsi`" /qn /norestart"
+            $gp = Start-Process -FilePath msiexec.exe -ArgumentList $gaArgs -PassThru -Wait
             if ($gp.ExitCode -eq 0) { foreach ($svc in $gaSvcNames) { Try-StartService -Name $svc | Out-Null }; $gaFound = $true }
         }
     }
@@ -220,7 +256,7 @@ function Repair-CloudbaseInitService {
     param([string]$MsiPath,[string]$Version = '1.1.6')
     Step 'Repair: verifying Cloudbase-Init service registration'
     $svcKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\cloudbase-init'
-    $base   = (Join-Path $ProgramFilesPreferred "Cloudbase Solutions\Cloudbase-Init")
+    $base   = "${env:ProgramFiles}\Cloudbase Solutions\Cloudbase-Init"
     $svc    = Get-Service -Name 'cloudbase-init' -ErrorAction SilentlyContinue
     $props  = Get-ItemProperty -Path $svcKey -ErrorAction SilentlyContinue
     $img    = $null; if ($props) { $img = $props.ImagePath }
@@ -250,8 +286,8 @@ function Repair-CloudbaseInitService {
         }
         if (-not (Test-Path $msi)) { throw "Repair failed: MSI not found at $msi" }
 
-        $args = "/i `"$msi`" /qn /norestart RUN_CLOUDBASEINIT_SERVICE=1 SYSPREP_DISABLED=1 RUN_SERVICE_AS_LOCAL_SYSTEM=1 /l*v C:\cloudbase-init-install.log"
-        $proc = Start-Process -FilePath $Msiexec -ArgumentList $args -PassThru -Wait
+        $args = "/i `"$msi`" /qn /norestart RUN_CLOUDBASEINIT_SERVICE=1 SYSPREP_DISABLED=1 RUN_SERVICE_AS_LOCAL_SYSTEM=1"
+        $proc = Start-Process -FilePath msiexec.exe -ArgumentList $args -PassThru -Wait
         if ($proc.ExitCode -ne 0) { throw "Repair failed: Cloudbase-Init installer exit code $($proc.ExitCode)" }
     }
 
@@ -273,6 +309,13 @@ function Repair-CloudbaseInitService {
 function Install-CloudbaseInit {
     if ($SkipCloudbaseInit) { Step 'Skip Cloudbase-Init (requested)'; return }
 
+    # Pre-check
+    if (Test-CloudbaseInitInstalled) {
+        Step 'Cloudbase-Init already installed; enforcing Automatic startup and continuing'
+        Ensure-ServiceAutoStart -Name 'cloudbase-init' -DependsOn @('nsi','Tcpip')
+        return
+    }
+
     Step "Install Cloudbase-Init ($CloudbaseInitVersion)"
     $arch = if ([Environment]::Is64BitOperatingSystem) {'x64'} else {'x86'}
     $vUnderscore = ($CloudbaseInitVersion -replace '\.','_')
@@ -286,12 +329,12 @@ function Install-CloudbaseInit {
     }
     if (-not (Test-Path $msiPath)) { throw "Cloudbase-Init MSI not found at $msiPath" }
 
-    $cbArgs = "/i `"$msiPath`" /qn /norestart RUN_CLOUDBASEINIT_SERVICE=1 SYSPREP_DISABLED=1 RUN_SERVICE_AS_LOCAL_SYSTEM=1 /l*v C:\cloudbase-init-install.log"
-    $proc = Start-Process -FilePath $Msiexec -ArgumentList $cbArgs -PassThru -Wait
+    $cbArgs = "/i `"$msiPath`" /qn /norestart RUN_CLOUDBASEINIT_SERVICE=1 SYSPREP_DISABLED=1 RUN_SERVICE_AS_LOCAL_SYSTEM=1"
+    $proc = Start-Process -FilePath msiexec.exe -ArgumentList $cbArgs -PassThru -Wait
     if ($proc.ExitCode -ne 0) { throw "Cloudbase-Init installer exit code: $($proc.ExitCode)" }
 
     Step 'Configure Cloudbase-Init for CloudStack password injection'
-    $cbRoot   = (Join-Path $ProgramFilesPreferred "Cloudbase Solutions\Cloudbase-Init")
+    $cbRoot   = "${env:ProgramFiles}\Cloudbase Solutions\Cloudbase-Init"
     $cbConfDir= Join-Path $cbRoot 'conf'
     $cbConf   = Join-Path $cbConfDir 'cloudbase-init.conf'
     if (-not (Test-Path $cbConfDir)) { New-Item -Path $cbConfDir -ItemType Directory -Force | Out-Null }
@@ -335,7 +378,7 @@ service_change_startup_type = true
     $startType = $null; if ($svc) { $startType = $svc.StartType }
     $svcKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\cloudbase-init'
     $imagePath = (Get-ItemProperty -Path $svcKey -Name ImagePath -ErrorAction SilentlyContinue).ImagePath
-    $base = (Join-Path $ProgramFilesPreferred "Cloudbase Solutions\Cloudbase-Init")
+    $base = "${env:ProgramFiles}\Cloudbase Solutions\Cloudbase-Init"
     $exe1 = Join-Path $base 'Python\Scripts\cloudbase-init.exe'
     $exe2 = Join-Path $base 'bin\OpenStackService.exe'
     $looksBroken = (-not $svc) -or (-not $imagePath) -or ((-not (Test-Path $exe1)) -and (-not (Test-Path $exe2)))
@@ -425,7 +468,7 @@ function Validate-PostSetup {
     try { $img=(Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\cloudbase-init' -Name ImagePath -ErrorAction SilentlyContinue).ImagePath; if($img){ "ImagePath: $img" | Write-Host } } catch {}
     $cb = Get-Service cloudbase-init -ErrorAction SilentlyContinue
     if ($cb) { "{0} - Status: {1} - StartType: {2}" -f $cb.Name, $cb.Status, $cb.StartType | Write-Host } else { Write-Host "cloudbase-init service not found!" -ForegroundColor Red }
-    $cbConf = Join-Path (Join-Path $ProgramFilesPreferred "Cloudbase Solutions\Cloudbase-Init\conf") "cloudbase-init.conf"
+    $cbConf = Join-Path "${env:ProgramFiles}\Cloudbase Solutions\Cloudbase-Init\conf" "cloudbase-init.conf"
     "cloudbase-init.conf exists? {0}" -f (Test-Path $cbConf) | Write-Host
 
     Step 'Validation: QEMU Guest Agent (optional)'
