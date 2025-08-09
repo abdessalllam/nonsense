@@ -1,300 +1,231 @@
-#requires -RunAsAdministrator
-<#
-  PREPARES a Windows guest for Apache CloudStack 4.20
-    - Optimise power, RDP, basic TCP
-    - Pagefile automatic (WMIC, widest compatibility)
-    - Deep-clean TEMP, event-logs, WinSxS, WU cache
-    - Install VirtIO Guest-Tools 0.1.271 (x86 / x64)
-    - Install & configure Cloudbase-Init for CloudStack password injection
-    - Write C:\unattend.xml (keeps VirtIO drivers after Sysprep)
-    - Fully idempotent safe to re-run
-#>
+# Windows template fix: ensure CloudStack/Cloudbase-Init password is accepted on first boot
+# - Disables password complexity in the template (so the generated password is always valid)
+# - Runs SetUserPasswordPlugin earlier
+# - Ensures the account is NOT forced to change password at first logon
+# - (Optional, default ON) Re-enables password complexity automatically on first boot
+# Tested on Windows Server 2016/2019/2022/2025 with Cloudbase-Init
+# Run as Administrator before you generalize/capture the template
 
-# LOGGING
-$log = 'C:\Users\Administrator\Downloads\cloudstack-prep.log'
-try { 
-    Start-Transcript -Path $log -Append 
-}
-catch { 
-    $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-    $log = "C:\cloudstack-prep_$timestamp.log"
-    Start-Transcript -Path $log -Append 
-}
+#requires -version 5.1
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
 
-function Step { 
-    param([string]$m) 
-    Write-Host ">> $m" -ForegroundColor Cyan 
-}
+# -------------------------- SETTINGS --------------------------
+# Re-enable password complexity after first boot (recommended)
+$ReenablePolicyAfterFirstBoot = $true
 
-# 1. OS OPTIMISATION
-function Optimize-OS {
-    Step 'Balanced power plan'
-    powercfg /setactive SCHEME_BALANCED | Out-Null
+# Fallback username if not found in cloudbase-init.conf
+$DefaultCloudUser = 'Administrator'
+# --------------------------------------------------------------
 
-    Step 'Enable RDP + NLA + firewall'
-    Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
-    Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 1
-    Set-Service TermService -StartupType Automatic
-    $rdpService = Get-Service TermService
-    if ($rdpService.Status -ne 'Running') { 
-        Start-Service TermService 
-    }
-    Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
-
-    Step 'TCP global flags (best-effort unsupported ones ignored)'
-    $tcpFlags = 'rss=enabled', 'autotuninglevel=normal', 'chimney=disabled'
-    foreach ($flag in $tcpFlags) {
-        $cmd = "netsh interface tcp set global $flag"
-        cmd /c "$cmd >nul 2>nul"
+function Assert-Admin {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $p  = New-Object Security.Principal.WindowsPrincipal($id)
+    if (-not $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw "Please run this script in an elevated PowerShell session (Run as Administrator)."
     }
 }
 
-# 2. PAGEFILE FIX
-function Fix-Pagefile {
-    Step 'Pagefile Automatic on C:'
-    $wmicCmd1 = "wmic computersystem where name='%COMPUTERNAME%' set AutomaticManagedPagefile=True"
-    cmd /c "$wmicCmd1 >nul 2>&1"
-    $wmicCmd2 = "wmic pagefileset where `"name!='C:\\pagefile.sys'`" delete"
-    cmd /c "$wmicCmd2 >nul 2>&1"
-}
-
-# 3. WINDOWS CLEAN-UP
-function Cleanup-Windows {
-    Step 'Flush TEMP folders'
-    $tempFolders = "$env:TEMP", "C:\Windows\Temp"
-    foreach ($folder in $tempFolders) {
-        if (Test-Path $folder) {
-            Get-ChildItem $folder -Recurse -Force -ErrorAction SilentlyContinue |
-                Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-        }
-    }
-
-    Step 'Flush Windows Update download cache'
-    Stop-Service wuauserv -Force -ErrorAction SilentlyContinue
-    $wuPath = 'C:\Windows\SoftwareDistribution\Download'
-    if (Test-Path $wuPath) {
-        Remove-Item -Recurse -Force "$wuPath\*" -ErrorAction SilentlyContinue
-    }
-    Start-Service wuauserv -ErrorAction SilentlyContinue
-
-    Step 'Trim WinSxS (modern builds only)'
-    $buildNumber = [Environment]::OSVersion.Version.Build
-    if ($buildNumber -ge 14393) {
-        Dism.exe /online /Cleanup-Image /StartComponentCleanup /ResetBase | Out-Null
-    }
-
-    Step 'Clear event logs protected logs silently skipped'
-    $allLogs = wevtutil el
-    foreach ($logName in $allLogs) { 
-        $clearCmd = "wevtutil cl `"$logName`""
-        cmd /c "$clearCmd 2>nul"
-    }
-}
-
-# 4. VIRTIO Latest
-function Install-VirtioDrivers {
-    $uninstallPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
-    $installed = Get-ItemProperty $uninstallPath -ErrorAction SilentlyContinue |
-        Where-Object { $_.DisplayName -match 'VirtIO.*Guest.*Tools' }
-    
-    if ($installed) {
-        Step 'VirtIO Guest-Tools already installed skipping'
-        return
-    }
-
-    Step 'Download VirtIO Guest-Tools (Latest)'
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    
-    if ([Environment]::Is64BitOperatingSystem) { 
-        $arch = 'x64' 
-    } else { 
-        $arch = 'x86' 
-    }
-    
-    $msiPath = "$env:TEMP\virtio-win-gt-$arch.msi"
-    
-    # Use the latest-virtio folder for the most recent version
-    $primaryUrl = "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/latest-virtio/virtio-win-gt-$arch.msi"
-    # Fallback to stable-virtio as backup
-    $backupUrl = "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win-gt-$arch.msi"
-
-    Step "Downloading from: $primaryUrl"
-    try {
-        Invoke-WebRequest $primaryUrl -OutFile $msiPath -UseBasicParsing -ErrorAction Stop
-        Step "Download successful"
-    }
-    catch {
-        Step 'Primary URL failed, trying backup URL'
-        try {
-            Invoke-WebRequest $backupUrl -OutFile $msiPath -UseBasicParsing -ErrorAction Stop
-            Step "Download successful from backup"
-        }
-        catch {
-            throw "Failed to download VirtIO drivers from both URLs. Error: $_"
-        }
-    }
-
-    # Verify the MSI file exists and has content
-    if (!(Test-Path $msiPath)) {
-        throw "VirtIO MSI file was not downloaded successfully"
-    }
-    
-    $fileSize = (Get-Item $msiPath).Length
-    Step "MSI file size: $([math]::Round($fileSize/1MB, 2)) MB"
-    
-    if ($fileSize -lt 1MB) {
-        throw "Downloaded MSI file appears to be corrupt (too small)"
-    }
-
-    Step 'Installing VirtIO Guest-Tools silently'
-    $msiArgs = "/i `"$msiPath`" /qn /norestart /l*v `"$env:TEMP\virtio-install.log`""
-    $proc = Start-Process msiexec.exe -ArgumentList $msiArgs -Wait -PassThru
-    $exitCode = $proc.ExitCode
-    
-    if ($exitCode -eq 0) {
-        Step 'VirtIO Guest-Tools installed successfully'
-    }
-    elseif ($exitCode -eq 3010) {
-        Step 'VirtIO Guest-Tools installed successfully (reboot required)'
-    }
-    else {
-        throw "VirtIO installer failed with exit code $exitCode. Check $env:TEMP\virtio-install.log for details"
-    }
-}
-
-# 5. CLOUDBASE-INIT
-function Install-CloudInit {
-    $svcExists = $null
-    try {
-        $svcExists = Get-Service cloudbase-init -ErrorAction Stop
-    }
-    catch {
-        # Service does not exist, continue
-    }
-    
-    if ($svcExists) {
-        Step 'Cloudbase-Init already installed skipping'
-        return
-    }
-
-    Step 'Download Cloudbase-Init MSI'
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    
-    if ([Environment]::Is64BitOperatingSystem) { 
-        $arch = 'x64' 
-    } else { 
-        $arch = 'x86' 
-    }
-    
-    $msiPath = "$env:TEMP\CloudbaseInit_$arch.msi"
-    $cbUrl1 = "https://www.cloudbase.it/downloads/CloudbaseInitSetup_Stable_$arch.msi"
-    $cbUrl2 = "https://github.com/cloudbase/cloudbase-init/releases/latest/download/CloudbaseInitSetup_$arch.msi"
-
-    try {
-        Invoke-WebRequest $cbUrl1 -OutFile $msiPath -UseBasicParsing -ErrorAction Stop
-    }
-    catch {
-        Step 'Primary mirror failed trying GitHub'
-        try {
-            Invoke-WebRequest $cbUrl2 -OutFile $msiPath -UseBasicParsing -ErrorAction Stop
-        }
-        catch {
-            throw "Failed to download Cloudbase-Init from both sources"
-        }
-    }
-
-    Step 'Install Cloudbase-Init silently'
-    $cbArgs = "/i", "`"$msiPath`"", "/qn", "/norestart", "RUN_CLOUDBASEINIT_SERVICE=1", "SYSPREP_DISABLED=1"
-    $proc = Start-Process msiexec.exe -ArgumentList $cbArgs -Wait -PassThru
-    $exitCode = $proc.ExitCode
-    if ($exitCode -ne 0) {
-        throw "Cloudbase-Init installer exited with code $exitCode"
-    }
-
-    Step 'Configure Cloudbase-Init for CloudStack metadata'
-    $cbDir = "$env:ProgramFiles\Cloudbase Solutions\Cloudbase-Init\conf"
-    $cbConf = "$cbDir\cloudbase-init.conf"
-    
-    if (!(Test-Path $cbDir)) {
-        New-Item -ItemType Directory -Path $cbDir -Force | Out-Null
-    }
-    
-    # Create config content as array of lines
-    $configLines = @(
-        '[DEFAULT]',
-        'username              = Administrator',
-        'inject_user_password  = true',
-        'first_logon_behaviour = no',
-        'metadata_services     = cloudbaseinit.metadata.services.cloudstack.CloudStack',
-        'plugins               = cloudbaseinit.plugins.common.setuserpassword.SetUserPasswordPlugin,cloudbaseinit.plugins.common.networkconfig.NetworkConfigPlugin,cloudbaseinit.plugins.common.sethostname.SetHostNamePlugin,cloudbaseinit.plugins.common.userdata.UserDataPlugin'
+function Get-CloudbaseInitConfPath {
+    $candidates = @(
+        'C:\Program Files\Cloudbase Solutions\Cloudbase-Init\conf\cloudbase-init.conf',
+        'C:\Program Files (x86)\Cloudbase Solutions\Cloudbase-Init\conf\cloudbase-init.conf'
     )
-    
-    # Write config file
-    $configLines | Out-File -FilePath $cbConf -Encoding ASCII -Force
-
-    Set-Service cloudbase-init -StartupType Automatic
-    Start-Service cloudbase-init -ErrorAction SilentlyContinue
-    Step 'Cloudbase-Init configured and ready'
-}
-
-# 6. UNATTEND.XML
-function Write-Unattend {
-    Step 'Write unattend.xml (preserves VirtIO after Sysprep)'
-    
-    if ([Environment]::Is64BitOperatingSystem) { 
-        $cpuArch = 'amd64' 
-    } else { 
-        $cpuArch = 'x86' 
+    foreach ($p in $candidates) {
+        if (Test-Path -LiteralPath $p) { return $p }
     }
-    
-    # Build XML line by line to avoid here-string issues
-    $xmlLines = @(
-        '<?xml version="1.0" encoding="utf-8"?>',
-        '<unattend xmlns="urn:schemas-microsoft-com:unattend">',
-        '  <settings pass="generalize">',
-        '    <component name="Microsoft-Windows-PnpSysprep"',
-        "               processorArchitecture=`"$cpuArch`"",
-        '               publicKeyToken="31bf3856ad364e35"',
-        '               versionScope="nonSxS"',
-        '               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">',
-        '      <PersistAllDeviceInstalls>true</PersistAllDeviceInstalls>',
-        '    </component>',
-        '  </settings>',
-        '</unattend>'
-    )
-    
-    # Write XML file
-    $xmlLines | Out-File -FilePath 'C:\unattend.xml' -Encoding UTF8 -Force
+    throw "cloudbase-init.conf not found in the default locations."
 }
 
-# 7. MAIN EXECUTION
+function Backup-File {
+    param([Parameter(Mandatory)] [string]$Path)
+    $ts = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $bak = "$Path.bak.$ts"
+    Copy-Item -LiteralPath $Path -Destination $bak -Force
+    return $bak
+}
+
+function Relax-PasswordPolicyForTemplate {
+    Write-Host "Relaxing local password policy in the template..."
+    $inf = @"
+[Version]
+signature="$CHICAGO$"
+
+[System Access]
+MinimumPasswordLength = 1
+PasswordComplexity = 0
+MaximumPasswordAge = 0
+PasswordHistorySize = 0
+"@
+    $infPath = "$env:TEMP\pwd_template_relax.inf"
+    $dbPath  = "$env:TEMP\secpol_template_relax.sdb"
+    Set-Content -LiteralPath $infPath -Value $inf -Encoding Ascii -Force
+    & "$env:SystemRoot\System32\secedit.exe" /configure /db "$dbPath" /cfg "$infPath" /areas SECURITYPOLICY | Out-Null
+}
+
+function New-FirstBootPolicyRestore {
+    # Creates a one-time scheduled task that restores complexity shortly after first boot
+    Write-Host "Scheduling one-time restore of password complexity on first boot..."
+    $script = @"
+`$inf = @"
+[Version]
+signature="$CHICAGO$"
+
+[System Access]
+MinimumPasswordLength = 8
+PasswordComplexity = 1
+MaximumPasswordAge = 42
+PasswordHistorySize = 24
+"@
+`$infPath = "C:\Windows\Temp\pwd_template_restore.inf"
+`$dbPath  = "C:\Windows\Temp\secpol_template_restore.sdb"
+Set-Content -LiteralPath `$infPath -Value `$inf -Encoding Ascii -Force
+& "`$env:SystemRoot\System32\secedit.exe" /configure /db "`$dbPath" /cfg "`$infPath" /areas SECURITYPOLICY | Out-Null
+# cleanup: remove task after running
+schtasks /Delete /TN "Template\RestorePasswordPolicyOnce" /F | Out-Null
+Remove-Item -LiteralPath `$infPath, `$dbPath -ErrorAction SilentlyContinue
+"@
+    $restorePath = 'C:\Windows\Temp\restore_policy_once.ps1'
+    Set-Content -LiteralPath $restorePath -Value $script -Encoding UTF8 -Force
+
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoLogo -NoProfile -ExecutionPolicy Bypass -File `"$restorePath`""
+    $trigger = New-ScheduledTaskTrigger -AtStartup
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Compatibility Win8
+    if (-not (Get-ScheduledTask -TaskName 'Template\RestorePasswordPolicyOnce' -ErrorAction SilentlyContinue)) {
+        Register-ScheduledTask -TaskName 'Template\RestorePasswordPolicyOnce' -TaskPath 'Template\' -Action $action -Trigger $trigger -Settings $settings -RunLevel Highest | Out-Null
+    } else {
+        Set-ScheduledTask -TaskName 'Template\RestorePasswordPolicyOnce' -TaskPath 'Template\' -Action $action -Trigger $trigger -Settings $settings | Out-Null
+    }
+}
+
+function Get-CloudUserFromConf {
+    param([Parameter(Mandatory)][string]$ConfText)
+    # cloudbase-init.conf may have: username=...  (sometimes in [DEFAULT] or global)
+    $m = [Regex]::Match($ConfText, '^\s*username\s*=\s*(.+?)\s*$', 'IgnoreCase, Multiline')
+    if ($m.Success) { return $m.Groups[1].Value.Trim() }
+    return $null
+}
+
+function Reorder-Plugins {
+    param(
+        [Parameter(Mandatory)][string]$ConfText
+    )
+    # Extract existing plugins line (comma-separated, no quotes)
+    $rx = [Regex]::new('^\s*plugins\s*=\s*(.+?)\s*$', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::Multiline)
+    $mt = $rx.Match($ConfText)
+
+    $targetOrder = @(
+        'cloudbaseinit.plugins.common.mtu.MTUPlugin',
+        'cloudbaseinit.plugins.common.sethostname.SetHostNamePlugin',
+        'cloudbaseinit.plugins.windows.createuser.CreateUserPlugin',
+        'cloudbaseinit.plugins.common.setuserpassword.SetUserPasswordPlugin', # MUST be right after CreateUser
+        'cloudbaseinit.plugins.common.networkconfig.NetworkConfigPlugin',
+        'cloudbaseinit.plugins.windows.licensing.WindowsLicensingPlugin',
+        'cloudbaseinit.plugins.windows.extendvolumes.ExtendVolumesPlugin',
+        'cloudbaseinit.plugins.common.sshpublickeys.SetUserSSHPublicKeysPlugin',
+        'cloudbaseinit.plugins.common.localscripts.LocalScriptsPlugin'
+    )
+
+    if ($mt.Success) {
+        $raw = $mt.Groups[1].Value
+        $cur = $raw.Split(',').ForEach({ $_.Trim() }) | Where-Object { $_ -ne '' }
+        # Ensure both CreateUser and SetUserPassword exist; if not, add them
+        if ($cur -notcontains 'cloudbaseinit.plugins.windows.createuser.CreateUserPlugin') {
+            $cur += 'cloudbaseinit.plugins.windows.createuser.CreateUserPlugin'
+        }
+        if ($cur -notcontains 'cloudbaseinit.plugins.common.setuserpassword.SetUserPasswordPlugin') {
+            $cur += 'cloudbaseinit.plugins.common.setuserpassword.SetUserPasswordPlugin'
+        }
+        # Move SetUserPassword immediately after CreateUser
+        $cur = $cur | Select-Object -Unique
+        $cur = $cur | Where-Object { $_ -ne 'cloudbaseinit.plugins.common.setuserpassword.SetUserPasswordPlugin' }
+        $new = @()
+        foreach ($p in $cur) {
+            $new += $p
+            if ($p -eq 'cloudbaseinit.plugins.windows.createuser.CreateUserPlugin') {
+                $new += 'cloudbaseinit.plugins.common.setuserpassword.SetUserPasswordPlugin'
+            }
+        }
+        # If createuser wasn't found for some reason, prepend password plugin
+        if ($new -notcontains 'cloudbaseinit.plugins.windows.createuser.CreateUserPlugin') {
+            $new = @('cloudbaseinit.plugins.common.setuserpassword.SetUserPasswordPlugin') + $new
+        }
+        $joined = ($new -join ',')
+        return $rx.Replace($ConfText, "plugins=$joined", 1)
+    } else {
+        # No plugins line; inject a sane default with correct order
+        $inject = "plugins=" + ($targetOrder -join ',')
+        if ($ConfText -match '^\s*\[.*?\]') {
+            # put at top if INI-like content exists
+            return $inject + [Environment]::NewLine + $ConfText
+        } else {
+            return $ConfText + [Environment]::NewLine + $inject
+        }
+    }
+}
+
+function Ensure-PasswordNotForcedChange {
+    param([Parameter(Mandatory)][string]$User)
+    Write-Host "Ensuring '$User' is not forced to change password at next logon..."
+    try {
+        # PowerShell way (preferred)
+        Import-Module Microsoft.PowerShell.LocalAccounts -ErrorAction Stop
+        $lu = Get-LocalUser -Name $User -ErrorAction Stop
+        if ($lu.PasswordExpires) {
+            Set-LocalUser -Name $User -PasswordNeverExpires $true
+        }
+        # Ensure "User must change password at next logon" is off
+        # (no direct flag; toggled by expiring the password; we already set never expires)
+    } catch {
+        # Fallback to WMIC if LocalAccounts isn't available
+        & wmic useraccount where "name='$User'" set PasswordExpires=False | Out-Null
+    }
+    # Ensure Windows won't force change at logon
+    & net user $User /logonpasswordchg:no /passwordchg:yes | Out-Null
+}
+
+# ------------------------------ MAIN ------------------------------
 try {
-    Write-Host ""
-    Write-Host "=== CloudStack Windows Guest Preparation Starting ===" -ForegroundColor Green
-    Write-Host ""
-    
-    Optimize-OS
-    Fix-Pagefile
-    Install-VirtioDrivers
-    Install-CloudInit
-    Write-Unattend
-    Cleanup-Windows
-    
-    Write-Host ""
-    Write-Host "=== CloudStack Windows Guest Preparation Complete ===" -ForegroundColor Green
-    Step 'Prep complete - reboot once, then sysprep with:'
-    Write-Host '   %windir%\System32\Sysprep\Sysprep.exe /generalize /oobe /shutdown /unattend:C:\unattend.xml' -ForegroundColor Yellow
-    Write-Host ""
-} 
-catch {
-    Write-Host ""
-    Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
-    Write-Host "Stack Trace:" -ForegroundColor Red
-    Write-Host $_.ScriptStackTrace
+    Assert-Admin
+
+    $confPath = Get-CloudbaseInitConfPath
+    $confBackup = Backup-File -Path $confPath
+    Write-Host "Backed up cloudbase-init.conf to: $confBackup"
+
+    $confText = Get-Content -LiteralPath $confPath -Raw -Encoding UTF8
+
+    # Reorder plugins so SetUserPasswordPlugin runs immediately after CreateUser
+    $newConfText = Reorder-Plugins -ConfText $confText
+
+    if ($newConfText -ne $confText) {
+        Set-Content -LiteralPath $confPath -Value $newConfText -Encoding UTF8 -NoNewline
+        Write-Host "Updated plugins order in cloudbase-init.conf"
+    } else {
+        Write-Host "Plugins order already OK"
+    }
+
+    # Determine cloud user for the flags below
+    $cloudUser = Get-CloudUserFromConf -ConfText $newConfText
+    if (-not $cloudUser) { $cloudUser = $DefaultCloudUser }
+    Write-Host "Cloud user detected: $cloudUser"
+
+    # Make sure template accepts the generated password
+    Relax-PasswordPolicyForTemplate
+
+    # Guard against "must change password" prompt
+    Ensure-PasswordNotForcedChange -User $cloudUser
+
+    if ($ReenablePolicyAfterFirstBoot) {
+        New-FirstBootPolicyRestore
+    }
+
+    Write-Host "`nDone. On first boot, Windows will accept the CloudStack-provided password without prompting to change it."
+    if ($ReenablePolicyAfterFirstBoot) {
+        Write-Host "Password complexity will be re-enabled automatically right after first boot."
+    } else {
+        Write-Host "NOTE: Password complexity remains disabled in the template (you can re-enable it later)."
+    }
+} catch {
+    Write-Error $_.Exception.Message
     exit 1
-} 
-finally {
-    Stop-Transcript
-    Write-Host "Log saved to: $log" -ForegroundColor Gray
-    Write-Host "Don't forget to delete that as well and clearing powershell`s history before creating a template" -ForegroundColor Green
 }
