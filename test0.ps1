@@ -1,8 +1,9 @@
-#requires -Version 5.1
+#requires -Version 3.0
 <#
-    CloudStack Windows Template Prep (Server 2016 → 2025) — v13-fixed-verified
+    CloudStack Windows Template Prep (Server 2016 → 2025) — v14-compat
     --------------------------------------------------------------------------
-    Double-checked version with additional error handling and compatibility fixes
+    Compatibility-fixed version for older PowerShell/Windows versions
+    Fixed registry operations to work with PS 3.0+ and various Windows versions
     
     Parameters:
       -CloudUser 'Administrator'
@@ -75,7 +76,7 @@ try {
     Write-Warning "Could not set TLS 1.2. Downloads might fail on older systems."
 }
 
-$log = 'C:\Users\Administrator\Downloads\cloudstack-prep.log'
+$log = 'C:\cloudstack-prep.log'
 $transcriptStarted = $false
 
 # Try to start transcript
@@ -88,7 +89,7 @@ try {
     $transcriptStarted = $true 
 } catch {
     $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-    $altLog = "C:\Users\Administrator\Downloads\cloudstack-prep_$timestamp.log"
+    $altLog = "C:\cloudstack-prep_$timestamp.log"
     try { 
         Start-Transcript -Path $altLog -Append -ErrorAction Stop | Out-Null
         $transcriptStarted = $true
@@ -120,6 +121,67 @@ function Write-Log {
     }
 }
 
+# Registry helper function for backward compatibility
+function Set-RegistryValue {
+    param(
+        [string]$Path,
+        [string]$Name,
+        [object]$Value,
+        [string]$RegType = 'DWord'
+    )
+    
+    try {
+        if (-not (Test-Path $Path)) {
+            New-Item -Path $Path -Force | Out-Null
+        }
+        
+        # Try different methods in order of preference
+        $success = $false
+        
+        # Method 1: Set-ItemProperty with -Type (PS 3.0+)
+        if (-not $success) {
+            try {
+                Set-ItemProperty -Path $Path -Name $Name -Value $Value -Type $RegType -Force -ErrorAction Stop
+                $success = $true
+            } catch {
+                # Failed, try next method
+            }
+        }
+        
+        # Method 2: New-ItemProperty (will overwrite if exists)
+        if (-not $success) {
+            try {
+                Remove-ItemProperty -Path $Path -Name $Name -Force -ErrorAction SilentlyContinue
+                New-ItemProperty -Path $Path -Name $Name -Value $Value -Force -ErrorAction Stop | Out-Null
+                $success = $true
+            } catch {
+                # Failed, try next method
+            }
+        }
+        
+        # Method 3: reg.exe command
+        if (-not $success) {
+            $regPath = $Path -replace 'HKLM:', 'HKLM'
+            $regTypeMap = @{
+                'DWord' = 'REG_DWORD'
+                'String' = 'REG_SZ'
+                'MultiString' = 'REG_MULTI_SZ'
+            }
+            $regTypeName = $regTypeMap[$RegType]
+            if (-not $regTypeName) { $regTypeName = 'REG_DWORD' }
+            
+            & reg add "$regPath" /v $Name /t $regTypeName /d $Value /f 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                $success = $true
+            }
+        }
+        
+        return $success
+    } catch {
+        return $false
+    }
+}
+
 # Try to import LocalAccounts module silently
 $localAccountsAvailable = $false
 try { 
@@ -138,12 +200,23 @@ function Try-StartService {
     try {
         $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
         if ($svc) {
+            # First ensure it's not disabled
             if ($svc.StartType -eq 'Disabled') {
-                Set-Service -Name $Name -StartupType Automatic -ErrorAction SilentlyContinue
+                try {
+                    Set-Service -Name $Name -StartupType Automatic -ErrorAction Stop
+                } catch {
+                    & sc.exe config $Name start= auto 2>&1 | Out-Null
+                }
             }
+            
+            # Now try to start it
             if ($svc.Status -ne 'Running') {
-                Start-Service -Name $Name -ErrorAction SilentlyContinue
-                Start-Sleep -Seconds 2
+                try {
+                    Start-Service -Name $Name -ErrorAction Stop
+                    Start-Sleep -Seconds 2
+                } catch {
+                    & sc.exe start $Name 2>&1 | Out-Null
+                }
             }
             return $true
         }
@@ -169,30 +242,35 @@ function Ensure-ServiceAutoStart {
             return 
         }
         
-        # Set to automatic start
-        Set-Service -Name $Name -StartupType Automatic -ErrorAction SilentlyContinue
+        # Set to automatic start using multiple methods
+        try {
+            Set-Service -Name $Name -StartupType Automatic -ErrorAction Stop
+        } catch {
+            # Fallback to sc.exe
+            & sc.exe config $Name start= auto 2>&1 | Out-Null
+        }
         
         # Try to start if not running
         if ($svc.Status -ne 'Running') { 
-            Start-Service -Name $Name -ErrorAction SilentlyContinue 
+            try {
+                Start-Service -Name $Name -ErrorAction Stop
+            } catch {
+                & sc.exe start $Name 2>&1 | Out-Null
+            }
         }
         
-        # Registry modifications
+        # Registry modifications with better compatibility
         $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$Name"
         if (Test-Path $regPath) {
-            try {
-                # Disable delayed start
-                Set-ItemProperty -Path $regPath -Name 'DelayedAutoStart' -Value 0 -PropertyType DWord -Force -ErrorAction SilentlyContinue
-                
-                # Set dependencies if specified and not empty
-                if ($DependsOn -and $DependsOn.Count -gt 0) {
-                    $validDeps = $DependsOn | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-                    if ($validDeps.Count -gt 0) {
-                        Set-ItemProperty -Path $regPath -Name 'DependOnService' -Value $validDeps -PropertyType MultiString -Force -ErrorAction SilentlyContinue
-                    }
+            # Disable delayed start
+            Set-RegistryValue -Path $regPath -Name 'DelayedAutoStart' -Value 0 -RegType 'DWord'
+            
+            # Set dependencies if specified and not empty
+            if ($DependsOn -and $DependsOn.Count -gt 0) {
+                $validDeps = $DependsOn | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+                if ($validDeps.Count -gt 0) {
+                    Set-RegistryValue -Path $regPath -Name 'DependOnService' -Value $validDeps -RegType 'MultiString'
                 }
-            } catch {
-                # Registry modification failed, but service exists so continue
             }
         }
         
@@ -282,26 +360,33 @@ function Optimize-OS {
     Step 'Enable RDP + NLA and open firewall'
     
     try {
-        # Create registry path if it doesn't exist
+        # Enable RDP using the helper function
         $tsPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
-        if (-not (Test-Path $tsPath)) {
-            New-Item -Path $tsPath -Force | Out-Null
+        if (Set-RegistryValue -Path $tsPath -Name 'fDenyTSConnections' -Value 0 -RegType 'DWord') {
+            Write-Log "RDP enabled in registry" "SUCCESS"
+        } else {
+            Write-Log "Could not set RDP registry value" "WARN"
         }
-        
-        # Enable RDP
-        Set-ItemProperty -Path $tsPath -Name 'fDenyTSConnections' -Value 0 -PropertyType DWord -Force -ErrorAction SilentlyContinue
         
         # Enable NLA
         $rdpTcpPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
-        if (-not (Test-Path $rdpTcpPath)) {
-            New-Item -Path $rdpTcpPath -Force | Out-Null
+        if (Set-RegistryValue -Path $rdpTcpPath -Name 'UserAuthentication' -Value 1 -RegType 'DWord') {
+            Write-Log "NLA enabled in registry" "SUCCESS"
+        } else {
+            Write-Log "Could not set NLA registry value" "WARN"
         }
-        Set-ItemProperty -Path $rdpTcpPath -Name 'UserAuthentication' -Value 1 -PropertyType DWord -Force -ErrorAction SilentlyContinue
         
-        Write-Log "RDP and NLA enabled" "SUCCESS"
-        
-        # Start Terminal Service
-        Try-StartService -Name 'TermService'
+        # Ensure Terminal Service is set to Automatic and started
+        try {
+            Set-Service -Name 'TermService' -StartupType Automatic -ErrorAction Stop
+            Start-Service -Name 'TermService' -ErrorAction SilentlyContinue
+            Write-Log "TermService set to Automatic and started" "SUCCESS"
+        } catch {
+            # Fallback to sc.exe
+            & sc.exe config TermService start= auto 2>&1 | Out-Null
+            & sc.exe start TermService 2>&1 | Out-Null
+            Write-Log "TermService configured via sc.exe" "SUCCESS"
+        }
         
         # Configure firewall - try multiple methods
         $firewallConfigured = $false
@@ -330,19 +415,13 @@ function Optimize-OS {
     Step 'Configure network wait at startup'
     try {
         $winlogonPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\CurrentVersion\Winlogon'
-        $pathParts = $winlogonPath -split '\\'
-        $currentPath = $pathParts[0]
         
-        # Create each part of the path
-        for ($i = 1; $i -lt $pathParts.Length; $i++) {
-            $currentPath = "$currentPath\$($pathParts[$i])"
-            if (-not (Test-Path $currentPath)) {
-                New-Item -Path $currentPath -Force | Out-Null
-            }
+        # Use the helper function to set the registry value
+        if (Set-RegistryValue -Path $winlogonPath -Name 'SyncForegroundPolicy' -Value 1 -RegType 'DWord') {
+            Write-Log "Network wait policy configured" "SUCCESS"
+        } else {
+            Write-Log "Could not set network wait policy" "WARN"
         }
-        
-        Set-ItemProperty -Path $winlogonPath -Name 'SyncForegroundPolicy' -Value 1 -PropertyType DWord -Force
-        Write-Log "Network wait policy configured" "SUCCESS"
     } catch {
         Write-Log "Error setting network wait policy: $_" "WARN"
     }
@@ -363,11 +442,16 @@ function Fix-Pagefile {
             }
         }
     } catch {
-        Write-Log "Error configuring pagefile: $_" "WARN"
+        Write-Log "WMI method failed, trying wmic command" "WARN"
         # Try alternative method using wmic
         try {
-            & wmic computersystem set AutomaticManagedPagefile=True 2>&1 | Out-Null
-        } catch {}
+            $output = & wmic computersystem set AutomaticManagedPagefile=True 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                Write-Log "Pagefile configured via wmic" "SUCCESS"
+            }
+        } catch {
+            Write-Log "Could not configure pagefile" "WARN"
+        }
     }
 }
 
@@ -898,9 +982,10 @@ $scriptStart = Get-Date
 
 try {
     Write-Host "`n=====================================================" -ForegroundColor Cyan
-    Write-Host " CloudStack Windows Template Preparation v13-verified" -ForegroundColor Cyan
+    Write-Host " CloudStack Windows Template Preparation v14-compat" -ForegroundColor Cyan
     Write-Host "=====================================================" -ForegroundColor Cyan
     Write-Log "Script started at: $scriptStart"
+    Write-Log "PowerShell Version: $($PSVersionTable.PSVersion)"
     Write-Log "Parameters: CloudUser=$CloudUser, SkipVirtIO=$SkipVirtIO, SkipCloudbaseInit=$SkipCloudbaseInit"
     
     # Execute preparation steps
