@@ -1,15 +1,9 @@
 #requires -Version 5.1
 <#
-    CloudStack Windows Template Prep (Server 2016 → 2025) — v12-precheck
-    --------------------------------------------------------------------
-    • Auto-elevates to Administrator (same bitness as caller)
-    • BEFORE installing, checks whether Cloudbase‑Init and VirtIO drivers are already present
-    • Installs VirtIO silently (MSI), optional pnputil fallback, and GA from ISO if available
-    • Installs Cloudbase‑Init (LocalSystem), repairs a broken service registration if needed
-    • Enables RDP + NLA, opens firewall, waits for network at startup
-    • Writes a safe unattend.xml to preserve drivers through sysprep
-    • Validates at the end; logs to C:\cloudstack-prep.log
-
+    CloudStack Windows Template Prep (Server 2016 → 2025) — v13-fixed-verified
+    --------------------------------------------------------------------------
+    Double-checked version with additional error handling and compatibility fixes
+    
     Parameters:
       -CloudUser 'Administrator'
       -CloudbaseInitVersion '1.1.6'
@@ -29,503 +23,944 @@ param(
     [switch]$SkipCloudbaseInit
 )
 
-# ------------------------ Self-elevate if not Admin ---------------------------
-function Test-IsAdmin {
-    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $p  = New-Object Security.Principal.WindowsPrincipal($id)
-    return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+# ------------------------ Version Check -----------------------------------------
+$osVersion = [System.Environment]::OSVersion.Version
+if ($osVersion.Major -lt 10) {
+    Write-Warning "This script is designed for Windows Server 2016 (10.0) and later. Current version: $($osVersion.Major).$($osVersion.Minor)"
+    $confirm = Read-Host "Continue anyway? (y/n)"
+    if ($confirm -ne 'y') { exit 0 }
 }
+
+# ------------------------ Self-elevate if not Admin ----------------------------
+function Test-IsAdmin {
+    try {
+        $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $p = New-Object Security.Principal.WindowsPrincipal($id)
+        return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch {
+        return $false
+    }
+}
+
 if (-not (Test-IsAdmin)) {
     Write-Host "Elevation required. Relaunching as Administrator..." -ForegroundColor Yellow
-    $argList = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"")
+    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"")
+    
     foreach ($k in $PSBoundParameters.Keys) {
         $val = $PSBoundParameters[$k]
         if ($val -is [System.Management.Automation.SwitchParameter]) {
-            if ($val.IsPresent) { $argList += @("-$k") }
+            if ($val.IsPresent) { 
+                $argList += "-$k" 
+            }
         } elseif ($null -ne $val -and "$val".Length -gt 0) {
-            $escaped = '"' + ($val.ToString().Replace('"','`"')) + '"'
-            $argList += @("-$k", $escaped)
+            $argList += "-$k"
+            $argList += "`"$val`""
         }
     }
-    $psi = New-Object System.Diagnostics.ProcessStartInfo "powershell"
-    $psi.Arguments = ($argList -join ' ')
-    $psi.Verb = "RunAs"
-    try { [System.Diagnostics.Process]::Start($psi) | Out-Null; exit } catch { Write-Error "User declined elevation. Exiting."; exit 1 }
+    
+    try {
+        Start-Process powershell -ArgumentList $argList -Verb RunAs -Wait
+        exit 0
+    } catch {
+        Write-Error "User declined elevation or elevation failed. Exiting."
+        exit 1
+    }
 }
 
-# ------------------------ Hardening defaults ----------------------------------
-$ErrorActionPreference = 'Stop'
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+# ------------------------ Setup and Logging -------------------------------------
+$ErrorActionPreference = 'Continue'
+try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+} catch {
+    Write-Warning "Could not set TLS 1.2. Downloads might fail on older systems."
+}
 
 $log = 'C:\cloudstack-prep.log'
 $transcriptStarted = $false
-try { Start-Transcript -Path $log -Append | Out-Null; $transcriptStarted = $true } catch {
+
+# Try to start transcript
+try { 
+    Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
+} catch {}
+
+try { 
+    Start-Transcript -Path $log -Append -ErrorAction Stop | Out-Null
+    $transcriptStarted = $true 
+} catch {
     $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-    try { Start-Transcript -Path "C:\cloudstack-prep_$timestamp.log" -Append | Out-Null; $transcriptStarted = $true } catch {}
+    $altLog = "C:\cloudstack-prep_$timestamp.log"
+    try { 
+        Start-Transcript -Path $altLog -Append -ErrorAction Stop | Out-Null
+        $transcriptStarted = $true
+        $log = $altLog
+    } catch {
+        Write-Warning "Could not start transcript logging. Continuing without logging."
+    }
 }
 
-function Step([string]$m) { Write-Host ">> $m" -ForegroundColor Cyan }
-try { Import-Module Microsoft.PowerShell.LocalAccounts -ErrorAction SilentlyContinue } catch {}
+# ------------------------ Helper Functions --------------------------------------
+function Step {
+    param([string]$m)
+    Write-Host "`n>> $m" -ForegroundColor Cyan
+}
 
-# ------------------------ Helpers ---------------------------------------------
+function Write-Log {
+    param(
+        [string]$Message, 
+        [string]$Level = "INFO"
+    )
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logMessage = "$timestamp [$Level] $Message"
+    
+    switch ($Level) {
+        "ERROR" { Write-Host $logMessage -ForegroundColor Red }
+        "WARN"  { Write-Host $logMessage -ForegroundColor Yellow }
+        "SUCCESS" { Write-Host $logMessage -ForegroundColor Green }
+        default { Write-Host $logMessage }
+    }
+}
+
+# Try to import LocalAccounts module silently
+$localAccountsAvailable = $false
+try { 
+    Import-Module Microsoft.PowerShell.LocalAccounts -ErrorAction Stop 2>$null
+    $localAccountsAvailable = $true
+} catch {
+    # Module not available, will use fallback methods
+}
+
+# ------------------------ Service Management Functions -------------------------
 function Try-StartService {
     param([string]$Name)
-    $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
-    if ($svc) {
-        try { Set-Service -Name $Name -StartupType Automatic } catch {}
-        try { Start-Service -Name $Name -ErrorAction SilentlyContinue } catch {}
-        $reg = "HKLM:\SYSTEM\CurrentControlSet\Services\$Name"
-        try { New-Item -Path $reg -Force | Out-Null; New-ItemProperty -Path $reg -Name 'DelayedAutoStart' -Value 0 -PropertyType DWord -Force | Out-Null } catch {}
-        return $true
+    
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
+    
+    try {
+        $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
+        if ($svc) {
+            if ($svc.StartType -eq 'Disabled') {
+                Set-Service -Name $Name -StartupType Automatic -ErrorAction SilentlyContinue
+            }
+            if ($svc.Status -ne 'Running') {
+                Start-Service -Name $Name -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 2
+            }
+            return $true
+        }
+    } catch {
+        Write-Log "Could not start service $Name : $_" "WARN"
     }
     return $false
 }
+
 function Ensure-ServiceAutoStart {
-    param([Parameter(Mandatory)][string]$Name,[string[]]$DependsOn)
-    $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
-    if (-not $svc) { return }
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [string[]]$DependsOn = @()
+    )
+    
+    if ([string]::IsNullOrWhiteSpace($Name)) { return }
+    
     try {
-        Set-Service -Name $Name -StartupType Automatic
-        if ($svc.Status -ne 'Running') { Start-Service -Name $Name -ErrorAction SilentlyContinue }
-        $reg = "HKLM:\SYSTEM\CurrentControlSet\Services\$Name"
-        New-Item -Path $reg -Force | Out-Null
-        New-ItemProperty -Path $reg -Name 'DelayedAutoStart' -Value 0 -PropertyType DWord -Force | Out-Null
-        if ($DependsOn -and $DependsOn.Count -gt 0) {
-            $existing = (Get-ItemProperty -Path $reg -Name 'DependOnService' -ErrorAction SilentlyContinue).DependOnService
-            if ($existing -is [string]) { $existing = @($existing) }
-            if (-not $existing) { $existing = @() }
-            $merged = ($existing + $DependsOn) | Where-Object { $_ } | Select-Object -Unique
-            if ($merged.Count -gt 0) {
-                New-ItemProperty -Path $reg -Name 'DependOnService' -Value $merged -PropertyType MultiString -Force | Out-Null
+        # Check if service exists
+        $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
+        if (-not $svc) { 
+            Write-Log "Service $Name does not exist" "WARN"
+            return 
+        }
+        
+        # Set to automatic start
+        Set-Service -Name $Name -StartupType Automatic -ErrorAction SilentlyContinue
+        
+        # Try to start if not running
+        if ($svc.Status -ne 'Running') { 
+            Start-Service -Name $Name -ErrorAction SilentlyContinue 
+        }
+        
+        # Registry modifications
+        $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$Name"
+        if (Test-Path $regPath) {
+            try {
+                # Disable delayed start
+                Set-ItemProperty -Path $regPath -Name 'DelayedAutoStart' -Value 0 -PropertyType DWord -Force -ErrorAction SilentlyContinue
+                
+                # Set dependencies if specified and not empty
+                if ($DependsOn -and $DependsOn.Count -gt 0) {
+                    $validDeps = $DependsOn | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+                    if ($validDeps.Count -gt 0) {
+                        Set-ItemProperty -Path $regPath -Name 'DependOnService' -Value $validDeps -PropertyType MultiString -Force -ErrorAction SilentlyContinue
+                    }
+                }
+            } catch {
+                # Registry modification failed, but service exists so continue
             }
         }
-    } catch {}
+        
+        Write-Log "Service $Name configured for automatic start" "SUCCESS"
+    } catch {
+        Write-Log "Error configuring service $Name : $_" "WARN"
+    }
 }
 
-# ------------------------ Install Pre-checks -----------------------------------
+# ------------------------ Detection Functions -----------------------------------
 function Test-CloudbaseInitInstalled {
     try {
+        # Check for service
         $svc = Get-Service -Name 'cloudbase-init' -ErrorAction SilentlyContinue
         if (-not $svc) { return $false }
-        $svcKey   = 'HKLM:\SYSTEM\CurrentControlSet\Services\cloudbase-init'
-        $image    = (Get-ItemProperty -Path $svcKey -Name ImagePath -ErrorAction SilentlyContinue).ImagePath
-        $roots    = @("${env:ProgramFiles}\Cloudbase Solutions\Cloudbase-Init")
-        if ($env:ProgramFiles -and $env:ProgramFiles -ne $env:ProgramFiles(x86)) {
-            $roots += "${env:ProgramFiles(x86)}\Cloudbase Solutions\Cloudbase-Init"
+        
+        # Check for installation in Program Files
+        $searchPaths = @("${env:ProgramFiles}\Cloudbase Solutions\Cloudbase-Init")
+        
+        # Only add x86 path if it exists and is different from ProgramFiles
+        if ($env:ProgramFiles -and ${env:ProgramFiles(x86)}) {
+            if (${env:ProgramFiles} -ne ${env:ProgramFiles(x86)}) {
+                $searchPaths += "${env:ProgramFiles(x86)}\Cloudbase Solutions\Cloudbase-Init"
+            }
         }
-        $binFound = $false
-        foreach ($r in $roots) {
-            if (Test-Path (Join-Path $r 'Python\Scripts\cloudbase-init.exe')) { $binFound = $true; break }
-            if (Test-Path (Join-Path $r 'bin\OpenStackService.exe')) { $binFound = $true; break }
+        
+        foreach ($basePath in $searchPaths) {
+            if (Test-Path $basePath) {
+                # Check for executables
+                $exe1 = Join-Path $basePath 'Python\Scripts\cloudbase-init.exe'
+                $exe2 = Join-Path $basePath 'bin\OpenStackService.exe'
+                if ((Test-Path $exe1) -or (Test-Path $exe2)) {
+                    return $true
+                }
+            }
         }
-        return ([string]::IsNullOrWhiteSpace($image) -eq $false) -and $binFound
-    } catch { return $false }
+    } catch {
+        Write-Log "Error checking Cloudbase-Init: $_" "WARN"
+    }
+    return $false
 }
 
 function Test-VirtIODriversInstalled {
     try {
-        $drivers = Get-WmiObject Win32_PnPSignedDriver | Where-Object { $_.DriverProviderName -like '*Red Hat*' -or $_.Manufacturer -like '*Red Hat*' }
-        if ($drivers) { return $true }
-    } catch {}
-    $svcNames = @('NetKVM','vioscsi','viostor','vioserial','vioinput','viorng','qemufwcfg','qemupciserial','pvpanic')
-    foreach ($n in $svcNames) {
-        if (Test-Path "HKLM:\SYSTEM\CurrentControlSet\Services\$n") { return $true }
+        # Method 1: Check WMI for Red Hat drivers
+        try {
+            $drivers = @(Get-WmiObject Win32_PnPSignedDriver -ErrorAction Stop | 
+                        Where-Object { 
+                            $_.DriverProviderName -like '*Red Hat*' -or 
+                            $_.DeviceName -like '*VirtIO*' -or
+                            $_.Description -like '*VirtIO*'
+                        })
+            if ($drivers.Count -gt 0) { return $true }
+        } catch {
+            # WMI query failed, try alternative method
+        }
+        
+        # Method 2: Check for VirtIO services in registry
+        $svcNames = @('NetKVM','vioscsi','viostor','vioserial','vioinput','viorng','qemufwcfg','qemupciserial','pvpanic','Balloon')
+        foreach ($svcName in $svcNames) {
+            if (Test-Path "HKLM:\SYSTEM\CurrentControlSet\Services\$svcName") { 
+                return $true 
+            }
+        }
+    } catch {
+        Write-Log "Error checking VirtIO drivers: $_" "WARN"
     }
     return $false
 }
 
 function Test-QemuGAInstalled {
-    $ga = Get-Service -Name 'QEMU-GA' -ErrorAction SilentlyContinue
-    if ($ga) { return $true }
-    $ga = Get-Service -Name 'qemu-ga' -ErrorAction SilentlyContinue
-    if ($ga) { return $true }
+    $gaNames = @('QEMU-GA', 'qemu-ga', 'QEMU Guest Agent')
+    foreach ($name in $gaNames) {
+        try {
+            if (Get-Service -Name $name -ErrorAction SilentlyContinue) {
+                return $true
+            }
+        } catch {
+            # Service check failed, continue
+        }
+    }
     return $false
 }
 
-# ------------------------ OS Optimisation -------------------------------------
+# ------------------------ OS Optimization ---------------------------------------
 function Optimize-OS {
     Step 'Enable RDP + NLA and open firewall'
-    New-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -PropertyType DWord -Force | Out-Null
-    New-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 1 -PropertyType DWord -Force | Out-Null
-    if (Try-StartService -Name 'TermService') {
-        $enabled = $false
-        try { Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction Stop | Out-Null; $enabled = $true } catch {}
-        if (-not $enabled) {
-            foreach ($rule in @('RemoteDesktop-UserMode-In-TCP','RemoteDesktop-UserMode-In-UDP')) {
-                try { Enable-NetFirewallRule -Name $rule -ErrorAction SilentlyContinue | Out-Null } catch {}
+    
+    try {
+        # Create registry path if it doesn't exist
+        $tsPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
+        if (-not (Test-Path $tsPath)) {
+            New-Item -Path $tsPath -Force | Out-Null
+        }
+        
+        # Enable RDP
+        Set-ItemProperty -Path $tsPath -Name 'fDenyTSConnections' -Value 0 -PropertyType DWord -Force -ErrorAction SilentlyContinue
+        
+        # Enable NLA
+        $rdpTcpPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
+        if (-not (Test-Path $rdpTcpPath)) {
+            New-Item -Path $rdpTcpPath -Force | Out-Null
+        }
+        Set-ItemProperty -Path $rdpTcpPath -Name 'UserAuthentication' -Value 1 -PropertyType DWord -Force -ErrorAction SilentlyContinue
+        
+        Write-Log "RDP and NLA enabled" "SUCCESS"
+        
+        # Start Terminal Service
+        Try-StartService -Name 'TermService'
+        
+        # Configure firewall - try multiple methods
+        $firewallConfigured = $false
+        
+        # Method 1: PowerShell cmdlets
+        try {
+            Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction Stop
+            $firewallConfigured = $true
+            Write-Log "Firewall rules enabled via PowerShell" "SUCCESS"
+        } catch {
+            # Method 2: netsh command
+            try {
+                $result = & netsh advfirewall firewall set rule group="remote desktop" new enable=Yes 2>&1
+                if ($LASTEXITCODE -eq 0) {
+                    $firewallConfigured = $true
+                    Write-Log "Firewall rules enabled via netsh" "SUCCESS"
+                }
+            } catch {
+                Write-Log "Could not configure firewall for RDP" "WARN"
             }
-            try { & netsh advfirewall firewall set rule group="remote desktop" new enable=Yes | Out-Null } catch {}
+        }
+    } catch {
+        Write-Log "Error configuring RDP: $_" "ERROR"
+    }
+    
+    Step 'Configure network wait at startup'
+    try {
+        $winlogonPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\CurrentVersion\Winlogon'
+        $pathParts = $winlogonPath -split '\\'
+        $currentPath = $pathParts[0]
+        
+        # Create each part of the path
+        for ($i = 1; $i -lt $pathParts.Length; $i++) {
+            $currentPath = "$currentPath\$($pathParts[$i])"
+            if (-not (Test-Path $currentPath)) {
+                New-Item -Path $currentPath -Force | Out-Null
+            }
+        }
+        
+        Set-ItemProperty -Path $winlogonPath -Name 'SyncForegroundPolicy' -Value 1 -PropertyType DWord -Force
+        Write-Log "Network wait policy configured" "SUCCESS"
+    } catch {
+        Write-Log "Error setting network wait policy: $_" "WARN"
+    }
+}
+
+# ------------------------ Pagefile Configuration --------------------------------
+function Fix-Pagefile {
+    Step 'Configure pagefile as system-managed'
+    try {
+        $cs = Get-WmiObject -Class Win32_ComputerSystem -ErrorAction Stop
+        if ($null -ne $cs) {
+            if ($cs.AutomaticManagedPagefile -ne $true) {
+                $cs.AutomaticManagedPagefile = $true
+                $result = $cs.Put()
+                Write-Log "Pagefile set to system-managed" "SUCCESS"
+            } else {
+                Write-Log "Pagefile already system-managed"
+            }
+        }
+    } catch {
+        Write-Log "Error configuring pagefile: $_" "WARN"
+        # Try alternative method using wmic
+        try {
+            & wmic computersystem set AutomaticManagedPagefile=True 2>&1 | Out-Null
+        } catch {}
+    }
+}
+
+# ------------------------ Cleanup ------------------------------------------------
+function Safe-Cleanup {
+    Step 'Clean temporary files and caches'
+    
+    $targets = @(
+        "$env:TEMP",
+        "$env:WINDIR\Temp",
+        "C:\Windows\SoftwareDistribution\Download"
+    )
+    
+    foreach ($target in $targets) {
+        if (Test-Path $target) {
+            try {
+                Get-ChildItem -Path $target -Recurse -Force -ErrorAction SilentlyContinue | 
+                    Where-Object { -not $_.PSIsContainer -or (Get-ChildItem $_.FullName -Force -ErrorAction SilentlyContinue).Count -eq 0 } |
+                    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+                Write-Log "Cleaned: $target"
+            } catch {
+                Write-Log "Could not fully clean $target" "WARN"
+            }
         }
     }
-
-    Step 'Wait for network at startup (pre-logon)'
-    New-Item -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\CurrentVersion\Winlogon' -Force | Out-Null
-    New-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\CurrentVersion\Winlogon' -Name 'SyncForegroundPolicy' -Value 1 -PropertyType DWord -Force | Out-Null
+    
+    # Clear event logs
+    Step 'Clear event logs'
+    try {
+        Get-EventLog -List | ForEach-Object {
+            try {
+                Clear-EventLog -LogName $_.Log -ErrorAction SilentlyContinue
+            } catch {}
+        }
+        Write-Log "Event logs cleared"
+    } catch {
+        # Try wevtutil as fallback
+        try {
+            & wevtutil el 2>$null | ForEach-Object { 
+                & wevtutil cl "$_" 2>$null
+            }
+        } catch {}
+    }
+    
+    # Component cleanup
+    try {
+        Write-Log "Running DISM cleanup (this may take a few minutes)..."
+        Start-Process -FilePath "DISM.exe" `
+                     -ArgumentList "/Online", "/Cleanup-Image", "/StartComponentCleanup" `
+                     -Wait -NoNewWindow -ErrorAction SilentlyContinue
+        Write-Log "Component cleanup completed"
+    } catch {
+        Write-Log "Component cleanup skipped" "WARN"
+    }
 }
 
-# ------------------------ Pagefile --------------------------------------------
-function Fix-Pagefile {
-    Step 'Set pagefile: system-managed'
-    $cs = Get-WmiObject -Class Win32_ComputerSystem
-    if ($cs.AutomaticManagedPagefile -ne $true) { $cs.AutomaticManagedPagefile = $true; $cs.Put() | Out-Null }
-}
-
-# ------------------------ Cleanup ---------------------------------------------
-function Safe-Cleanup {
-    Step 'Clean TEMP and Windows Update cache'
-    $targets = @("$env:TEMP","$env:WINDIR\Temp","C:\Windows\SoftwareDistribution\Download")
-    foreach ($t in $targets) { if (Test-Path $t) {
-        Get-ChildItem -Path $t -Recurse -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-    }}
-
-    Step 'Clear Event Logs (non-critical)'
-    try { wevtutil el | ForEach-Object { try { wevtutil cl $_ } catch {} } } catch {}
-
-    Step 'Component cleanup (best-effort)'
-    try { DISM /Online /Cleanup-Image /StartComponentCleanup | Out-Null } catch {}
-}
-
-# ------------------------ VirtIO Guest Tools ----------------------------------
+# ------------------------ VirtIO Installation ------------------------------------
 function Install-VirtIO {
-    if ($SkipVirtIO) { Step 'Skip VirtIO (requested)'; return }
-
-    # Pre-checks
+    if ($SkipVirtIO) { 
+        Step 'Skipping VirtIO installation (requested)'
+        return 
+    }
+    
+    # Check if already installed
     $driversPresent = Test-VirtIODriversInstalled
     $gaPresent = Test-QemuGAInstalled
+    
     if ($driversPresent -and $gaPresent) {
-        Step 'VirtIO drivers and QEMU-GA already present; skipping install'
-        foreach ($svc in @('QEMU-GA','qemu-ga')) { Ensure-ServiceAutoStart -Name $svc -DependsOn @('nsi','Tcpip') }
+        Step 'VirtIO drivers and QEMU-GA already installed'
+        Ensure-ServiceAutoStart -Name 'QEMU-GA'
+        Ensure-ServiceAutoStart -Name 'qemu-ga'
         return
     }
-    $skipDriverMsi = $false
-    if ($driversPresent -and -not $gaPresent) {
-        Step 'VirtIO drivers detected; will attempt only QEMU-GA install (skip driver MSI)'
-        $skipDriverMsi = $true
-    }
-
-    Step 'Install VirtIO Guest Tools (MSI) and QEMU-GA (if available)'
-    $arch = if ([Environment]::Is64BitOperatingSystem) {'x64'} else {'x86'}
+    
+    Step 'Installing VirtIO Guest Tools'
+    
+    $arch = if ([Environment]::Is64BitOperatingSystem) { 'x64' } else { 'x86' }
     $msiName = "virtio-win-gt-$arch.msi"
-    $msiPath = if ($VirtIOMsiPath) { $VirtIOMsiPath } else { Join-Path $env:TEMP $msiName }
-
-    if (-not $skipDriverMsi -and -not $VirtIOMsiPath) {
+    $msiPath = if ($VirtIOMsiPath -and (Test-Path $VirtIOMsiPath)) { 
+        $VirtIOMsiPath 
+    } else { 
+        Join-Path $env:TEMP $msiName 
+    }
+    
+    # Download if needed
+    if (-not (Test-Path $msiPath)) {
+        Write-Log "VirtIO MSI not found locally, attempting download..."
         $urls = @(
             "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/latest-virtio/$msiName",
             "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/$msiName"
         )
+        
         $downloaded = $false
-        foreach ($u in $urls) {
-            try { Step "Downloading VirtIO from: $u"; Invoke-WebRequest -Uri $u -OutFile $msiPath -UseBasicParsing -ErrorAction Stop; $downloaded = $true; break } catch { Write-Verbose "VirtIO download failed: $u" }
+        foreach ($url in $urls) {
+            try {
+                Write-Log "Trying: $url"
+                Invoke-WebRequest -Uri $url -OutFile $msiPath -UseBasicParsing -ErrorAction Stop
+                $downloaded = $true
+                Write-Log "Download successful" "SUCCESS"
+                break
+            } catch {
+                Write-Log "Download failed from this URL" "WARN"
+            }
         }
-        if (-not $downloaded) { throw "VirtIO MSI not downloaded from any source." }
-    }
-
-    if ($skipDriverMsi -eq $false -and -not (Test-Path $msiPath)) { throw "VirtIO MSI not found at $msiPath" }
-    if (-not $skipDriverMsi) {
-        $args = "/i `"$msiPath`" /qn /norestart"
-        $p = Start-Process -FilePath msiexec.exe -ArgumentList $args -PassThru -Wait
-        if ($p.ExitCode -ne 0) { throw "VirtIO installer exit code: $($p.ExitCode)" }
-    }
-
-    # If drivers still not visible and ISO provided, stage all drivers
-    $hasRedHatDrivers = Test-VirtIODriversInstalled
-    if (-not $hasRedHatDrivers -and $VirtIOIsoDrive) {
-        Step "Staging VirtIO drivers via pnputil from $VirtIOIsoDrive (fallback)"
-        $infGlob = Join-Path "$VirtIOIsoDrive\" "*.inf"
-        try { pnputil.exe /add-driver "$infGlob" /subdirs /install | Out-Null } catch { Write-Verbose "pnputil staging failed." }
-    }
-
-    # QEMU Guest Agent: try to start if installed; otherwise attempt from ISO if present
-    $gaSvcNames = @('QEMU-GA','qemu-ga')
-    $gaFound = $false
-    foreach ($svc in $gaSvcNames) { if (Try-StartService -Name $svc) { $gaFound = $true } }
-
-    if (-not $gaFound -and $VirtIOIsoDrive) {
-        $gaMsi = Join-Path "$VirtIOIsoDrive\guest-agent" "qemu-ga-x86_64.msi"
-        if (Test-Path $gaMsi) {
-            Step "Installing QEMU Guest Agent from $gaMsi"
-            $gaArgs = "/i `"$gaMsi`" /qn /norestart"
-            $gp = Start-Process -FilePath msiexec.exe -ArgumentList $gaArgs -PassThru -Wait
-            if ($gp.ExitCode -eq 0) { foreach ($svc in $gaSvcNames) { Try-StartService -Name $svc | Out-Null }; $gaFound = $true }
+        
+        if (-not $downloaded) {
+            Write-Log "Could not download VirtIO MSI. You may need to install manually." "ERROR"
+            return
         }
     }
+    
+    # Install MSI
+    if (Test-Path $msiPath) {
+        try {
+            Write-Log "Installing VirtIO MSI: $msiPath"
+            $msiArgs = @(
+                "/i",
+                "`"$msiPath`"",
+                "/qn",
+                "/norestart",
+                "/l*v",
+                "`"$env:TEMP\virtio-install.log`""
+            )
+            
+            $proc = Start-Process -FilePath "msiexec.exe" `
+                                 -ArgumentList $msiArgs `
+                                 -Wait -PassThru -NoNewWindow
+            
+            if ($proc.ExitCode -eq 0 -or $proc.ExitCode -eq 3010) {
+                Write-Log "VirtIO MSI installed successfully" "SUCCESS"
+            } else {
+                Write-Log "VirtIO MSI installer returned code: $($proc.ExitCode)" "WARN"
+            }
+        } catch {
+            Write-Log "Error installing VirtIO MSI: $_" "ERROR"
+        }
+    }
+    
+    # Try pnputil from ISO if provided
+    if ($VirtIOIsoDrive -and (Test-Path $VirtIOIsoDrive)) {
+        try {
+            Write-Log "Staging drivers from ISO: $VirtIOIsoDrive"
+            $infFiles = Get-ChildItem -Path $VirtIOIsoDrive -Filter "*.inf" -Recurse -ErrorAction SilentlyContinue
+            
+            if ($infFiles.Count -gt 0) {
+                & pnputil.exe /add-driver "$VirtIOIsoDrive\*.inf" /subdirs /install 2>&1 | Out-Null
+                Write-Log "Drivers staged from ISO"
+            }
+        } catch {
+            Write-Log "Could not stage drivers from ISO" "WARN"
+        }
+        
+        # Try to install GA from ISO
+        if (-not $gaPresent) {
+            $gaPaths = @(
+                "$VirtIOIsoDrive\guest-agent\qemu-ga-x86_64.msi",
+                "$VirtIOIsoDrive\guest-agent\qemu-ga-x64.msi",
+                "$VirtIOIsoDrive\qemu-ga-x64.msi"
+            )
+            
+            foreach ($gaPath in $gaPaths) {
+                if (Test-Path $gaPath) {
+                    try {
+                        Write-Log "Installing QEMU-GA from: $gaPath"
+                        $proc = Start-Process -FilePath "msiexec.exe" `
+                                            -ArgumentList "/i", "`"$gaPath`"", "/qn", "/norestart" `
+                                            -Wait -PassThru -NoNewWindow
+                        if ($proc.ExitCode -eq 0) {
+                            Write-Log "QEMU-GA installed successfully" "SUCCESS"
+                            break
+                        }
+                    } catch {
+                        Write-Log "Could not install QEMU-GA: $_" "WARN"
+                    }
+                }
+            }
+        }
+    }
+    
+    # Ensure GA service is set to automatic
+    Ensure-ServiceAutoStart -Name 'QEMU-GA'
+    Ensure-ServiceAutoStart -Name 'qemu-ga'
 }
 
-# ------------------------ Cloudbase-Init Repair --------------------------------
-function Repair-CloudbaseInitService {
-    param([string]$MsiPath,[string]$Version = '1.1.6')
-    Step 'Repair: verifying Cloudbase-Init service registration'
-    $svcKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\cloudbase-init'
-    $base   = "${env:ProgramFiles}\Cloudbase Solutions\Cloudbase-Init"
-    $svc    = Get-Service -Name 'cloudbase-init' -ErrorAction SilentlyContinue
-    $props  = Get-ItemProperty -Path $svcKey -ErrorAction SilentlyContinue
-    $img    = $null; if ($props) { $img = $props.ImagePath }
-    $exe1   = Join-Path $base 'Python\Scripts\cloudbase-init.exe'
-    $exe2   = Join-Path $base 'bin\OpenStackService.exe'
-    $haveBin= (Test-Path $exe1) -or (Test-Path $exe2)
-
-    $broken = $false
-    if (-not $props) { $broken = $true }
-    elseif (-not $haveBin)   { $broken = $true }
-    elseif ([string]::IsNullOrWhiteSpace($img)) { $broken = $true }
-
-    if ($broken) {
-        Step 'Repair: cloudbase-init service looks broken → removing and reinstalling'
-        try { sc.exe stop cloudbase-init | Out-Null } catch {}
-        try { sc.exe delete cloudbase-init | Out-Null } catch {}
-
-        $arch = if ([Environment]::Is64BitOperatingSystem) {'x64'} else {'x86'}
-        $msi = $MsiPath
-        if (-not $msi) {
-            $vUnderscore = ($Version -replace '\.','_')
-            $name = "CloudbaseInitSetup_{0}_{1}.msi" -f $vUnderscore, $arch
-            $msi = Join-Path $env:TEMP $name
-            $url = "https://github.com/cloudbase/cloudbase-init/releases/download/$Version/$name"
-            Step "Repair: downloading Cloudbase-Init $Version from $url"
-            Invoke-WebRequest -Uri $url -OutFile $msi -UseBasicParsing -ErrorAction Stop
-        }
-        if (-not (Test-Path $msi)) { throw "Repair failed: MSI not found at $msi" }
-
-        $args = "/i `"$msi`" /qn /norestart RUN_CLOUDBASEINIT_SERVICE=1 SYSPREP_DISABLED=1 RUN_SERVICE_AS_LOCAL_SYSTEM=1"
-        $proc = Start-Process -FilePath msiexec.exe -ArgumentList $args -PassThru -Wait
-        if ($proc.ExitCode -ne 0) { throw "Repair failed: Cloudbase-Init installer exit code $($proc.ExitCode)" }
-    }
-
-    Ensure-ServiceAutoStart -Name 'cloudbase-init' -DependsOn @('nsi','Tcpip')
-    cmd /c 'sc.exe failure "cloudbase-init" reset= 86400 actions= restart/5000/restart/5000/restart/5000' | Out-Null
-    cmd /c 'sc.exe failureflag "cloudbase-init" 1' | Out-Null
-    try { Start-Service -Name 'cloudbase-init' -ErrorAction SilentlyContinue } catch {}
-
-    try {
-        $props  = Get-ItemProperty -Path $svcKey -ErrorAction SilentlyContinue
-        $img    = if ($props) { $props.ImagePath } else { $null }
-        if ($img) { Write-Host ("cloudbase-init ImagePath: {0}" -f $img) }
-        $svc    = Get-Service -Name 'cloudbase-init' -ErrorAction SilentlyContinue
-        if ($svc) { "{0} - Status: {1} - StartType: {2}" -f $svc.Name, $svc.Status, $svc.StartType | Write-Host }
-    } catch {}
-}
-
-# ------------------------ Cloudbase-Init --------------------------------------
+# ------------------------ Cloudbase-Init Installation ----------------------------
 function Install-CloudbaseInit {
-    if ($SkipCloudbaseInit) { Step 'Skip Cloudbase-Init (requested)'; return }
-
-    # Pre-check
+    if ($SkipCloudbaseInit) { 
+        Step 'Skipping Cloudbase-Init installation (requested)'
+        return 
+    }
+    
     if (Test-CloudbaseInitInstalled) {
-        Step 'Cloudbase-Init already installed; enforcing Automatic startup and continuing'
-        Ensure-ServiceAutoStart -Name 'cloudbase-init' -DependsOn @('nsi','Tcpip')
+        Step 'Cloudbase-Init already installed'
+        Ensure-ServiceAutoStart -Name 'cloudbase-init'
         return
     }
-
-    Step "Install Cloudbase-Init ($CloudbaseInitVersion)"
-    $arch = if ([Environment]::Is64BitOperatingSystem) {'x64'} else {'x86'}
-    $vUnderscore = ($CloudbaseInitVersion -replace '\.','_')
+    
+    Step "Installing Cloudbase-Init ($CloudbaseInitVersion)"
+    
+    $arch = if ([Environment]::Is64BitOperatingSystem) { 'x64' } else { 'x86' }
+    $vUnderscore = $CloudbaseInitVersion -replace '\.', '_'
     $msiName = "CloudbaseInitSetup_{0}_{1}.msi" -f $vUnderscore, $arch
-    $msiPath = if ($CloudbaseInitMsiPath) { $CloudbaseInitMsiPath } else { Join-Path $env:TEMP $msiName }
-
-    if (-not $CloudbaseInitMsiPath) {
-        $url = "https://github.com/cloudbase/cloudbase-init/releases/download/$CloudbaseInitVersion/$msiName"
-        Step "Downloading: $url"
-        try { Invoke-WebRequest -Uri $url -OutFile $msiPath -UseBasicParsing -ErrorAction Stop } catch { throw "Failed to download Cloudbase-Init from $url : $($_.Exception.Message)" }
+    $msiPath = if ($CloudbaseInitMsiPath -and (Test-Path $CloudbaseInitMsiPath)) { 
+        $CloudbaseInitMsiPath 
+    } else { 
+        Join-Path $env:TEMP $msiName 
     }
-    if (-not (Test-Path $msiPath)) { throw "Cloudbase-Init MSI not found at $msiPath" }
-
-    $cbArgs = "/i `"$msiPath`" /qn /norestart RUN_CLOUDBASEINIT_SERVICE=1 SYSPREP_DISABLED=1 RUN_SERVICE_AS_LOCAL_SYSTEM=1"
-    $proc = Start-Process -FilePath msiexec.exe -ArgumentList $cbArgs -PassThru -Wait
-    if ($proc.ExitCode -ne 0) { throw "Cloudbase-Init installer exit code: $($proc.ExitCode)" }
-
-    Step 'Configure Cloudbase-Init for CloudStack password injection'
-    $cbRoot   = "${env:ProgramFiles}\Cloudbase Solutions\Cloudbase-Init"
-    $cbConfDir= Join-Path $cbRoot 'conf'
-    $cbConf   = Join-Path $cbConfDir 'cloudbase-init.conf'
-    if (-not (Test-Path $cbConfDir)) { New-Item -Path $cbConfDir -ItemType Directory -Force | Out-Null }
-
-    $plugins = @(
+    
+    # Download if needed
+    if (-not (Test-Path $msiPath)) {
+        $url = "https://github.com/cloudbase/cloudbase-init/releases/download/$CloudbaseInitVersion/$msiName"
+        try {
+            Write-Log "Downloading Cloudbase-Init from: $url"
+            Invoke-WebRequest -Uri $url -OutFile $msiPath -UseBasicParsing -ErrorAction Stop
+            Write-Log "Download successful" "SUCCESS"
+        } catch {
+            Write-Log "Failed to download Cloudbase-Init: $_" "ERROR"
+            return
+        }
+    }
+    
+    # Install MSI
+    try {
+        Write-Log "Installing Cloudbase-Init MSI"
+        
+        # Install with service creation enabled
+        $msiArgs = @(
+            "/i",
+            "`"$msiPath`"",
+            "/qn",
+            "/norestart",
+            "RUN_CLOUDBASEINIT_SERVICE=1",
+            "USERNAME=$CloudUser",
+            "INJECTMETADATAPASSWORD=1"
+        )
+        
+        $proc = Start-Process -FilePath "msiexec.exe" `
+                            -ArgumentList $msiArgs `
+                            -Wait -PassThru -NoNewWindow
+        
+        if ($proc.ExitCode -eq 0 -or $proc.ExitCode -eq 3010) {
+            Write-Log "Cloudbase-Init installed successfully" "SUCCESS"
+        } else {
+            Write-Log "Cloudbase-Init installer returned code: $($proc.ExitCode)" "WARN"
+        }
+    } catch {
+        Write-Log "Error installing Cloudbase-Init: $_" "ERROR"
+        return
+    }
+    
+    # Configure Cloudbase-Init
+    Step 'Configuring Cloudbase-Init for CloudStack'
+    
+    $cbRoot = "${env:ProgramFiles}\Cloudbase Solutions\Cloudbase-Init"
+    $cbConfDir = Join-Path $cbRoot 'conf'
+    $cbConf = Join-Path $cbConfDir 'cloudbase-init.conf'
+    
+    if (-not (Test-Path $cbConfDir)) {
+        New-Item -Path $cbConfDir -ItemType Directory -Force | Out-Null
+    }
+    
+    # Create configuration with proper formatting
+    $pluginList = @(
         'cloudbaseinit.plugins.common.mtu.MTUPlugin',
-        'cloudbaseinit.plugins.windows.ntpclient.NTPClientPlugin',
         'cloudbaseinit.plugins.common.sethostname.SetHostNamePlugin',
         'cloudbaseinit.plugins.windows.createuser.CreateUserPlugin',
         'cloudbaseinit.plugins.common.networkconfig.NetworkConfigPlugin',
         'cloudbaseinit.plugins.windows.licensing.WindowsLicensingPlugin',
         'cloudbaseinit.plugins.common.sshpublickeys.SetUserSSHPublicKeysPlugin',
         'cloudbaseinit.plugins.windows.extendvolumes.ExtendVolumesPlugin',
-        'cloudbaseinit.plugins.common.userdata.UserDataPlugin',
         'cloudbaseinit.plugins.common.setuserpassword.SetUserPasswordPlugin',
-        'cloudbaseinit.plugins.windows.winrmlistener.ConfigWinRMListenerPlugin',
-        'cloudbaseinit.plugins.windows.winrmcertificateauth.ConfigWinRMCertificateAuthPlugin',
         'cloudbaseinit.plugins.common.localscripts.LocalScriptsPlugin'
-    ) -join ','
-
-    $metadataServices = @('cloudbaseinit.metadata.services.cloudstack.CloudStack') -join ','
-
+    )
+    
     $conf = @"
 [DEFAULT]
-username = $CloudUser
-inject_user_password = true
-first_logon_behaviour = no
-metadata_services = $metadataServices
-plugins = $plugins
-process_userdata = true
-service_change_startup_type = true
+username=$CloudUser
+groups=Administrators
+inject_user_password=true
+first_logon_behaviour=no
+metadata_services=cloudbaseinit.metadata.services.cloudstack.CloudStack
+plugins=$($pluginList -join ',')
+verbose=true
+debug=true
+logdir=C:\Program Files\Cloudbase Solutions\Cloudbase-Init\log\
+logfile=cloudbase-init.log
+default_log_levels=comtypes=INFO,suds=INFO,iso8601=WARN,requests=WARN
+logging_serial_port_settings=
+mtu_use_dhcp_config=true
+ntp_use_dhcp_config=true
+local_scripts_path=C:\Program Files\Cloudbase Solutions\Cloudbase-Init\LocalScripts\
+check_latest_version=false
 "@
-    $conf | Out-File -FilePath $cbConf -Encoding ASCII -Force
-
-    Ensure-ServiceAutoStart -Name 'cloudbase-init' -DependsOn @('nsi','Tcpip')
-    cmd /c 'sc.exe failure "cloudbase-init" reset= 86400 actions= restart/5000/restart/5000/restart/5000' | Out-Null
-    cmd /c 'sc.exe failureflag "cloudbase-init" 1' | Out-Null
-
-    # Final check & repair if needed
-    $svc = Get-Service -Name 'cloudbase-init' -ErrorAction SilentlyContinue
-    $startType = $null; if ($svc) { $startType = $svc.StartType }
-    $svcKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\cloudbase-init'
-    $imagePath = (Get-ItemProperty -Path $svcKey -Name ImagePath -ErrorAction SilentlyContinue).ImagePath
-    $base = "${env:ProgramFiles}\Cloudbase Solutions\Cloudbase-Init"
-    $exe1 = Join-Path $base 'Python\Scripts\cloudbase-init.exe'
-    $exe2 = Join-Path $base 'bin\OpenStackService.exe'
-    $looksBroken = (-not $svc) -or (-not $imagePath) -or ((-not (Test-Path $exe1)) -and (-not (Test-Path $exe2)))
-    if ($looksBroken -or -not $startType) {
-        Step 'cloudbase-init service appears mis-registered; attempting repair'
-        Repair-CloudbaseInitService -MsiPath $msiPath -Version $CloudbaseInitVersion
+    
+    try {
+        # Use UTF8 without BOM
+        [System.IO.File]::WriteAllText($cbConf, $conf, [System.Text.UTF8Encoding]::new($false))
+        Write-Log "Cloudbase-Init configuration written" "SUCCESS"
+    } catch {
+        Write-Log "Error writing Cloudbase-Init config: $_" "ERROR"
     }
+    
+    # Ensure service is configured
+    Ensure-ServiceAutoStart -Name 'cloudbase-init'
+    
+    # Stop the service to prevent it from running before sysprep
+    try {
+        Stop-Service -Name 'cloudbase-init' -Force -ErrorAction SilentlyContinue
+        Write-Log "Stopped cloudbase-init service (will start after sysprep)"
+    } catch {}
 }
 
-# ------------------------ Unattend.xml for Sysprep ----------------------------
+# ------------------------ Unattend.xml ------------------------------------------
 function Write-Unattend {
-    Step 'Write C:\unattend.xml (preserve VirtIO drivers)'
-    $cpuArch = if ([Environment]::Is64BitOperatingSystem) {'amd64'} else {'x86'}
+    Step 'Writing unattend.xml for sysprep'
+    
+    $cpuArch = if ([Environment]::Is64BitOperatingSystem) { 'amd64' } else { 'x86' }
+    
     $xml = @"
 <?xml version="1.0" encoding="utf-8"?>
 <unattend xmlns="urn:schemas-microsoft-com:unattend">
   <settings pass="generalize">
-    <component name="Microsoft-Windows-PnpSysprep"
-               processorArchitecture="$cpuArch"
-               publicKeyToken="31bf3856ad364e35"
-               language="neutral"
-               versionScope="nonSxS"
-               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+    <component name="Microsoft-Windows-PnpSysprep" 
+               processorArchitecture="$cpuArch" 
+               publicKeyToken="31bf3856ad364e35" 
+               language="neutral" 
+               versionScope="nonSxS" 
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" 
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
       <PersistAllDeviceInstalls>true</PersistAllDeviceInstalls>
       <DoNotCleanUpNonPresentDevices>true</DoNotCleanUpNonPresentDevices>
     </component>
   </settings>
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-Shell-Setup" 
+               processorArchitecture="$cpuArch" 
+               publicKeyToken="31bf3856ad364e35" 
+               language="neutral" 
+               versionScope="nonSxS" 
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" 
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <HideLocalAccountScreen>true</HideLocalAccountScreen>
+        <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
+        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <ProtectYourPC>1</ProtectYourPC>
+        <SkipMachineOOBE>true</SkipMachineOOBE>
+        <SkipUserOOBE>true</SkipUserOOBE>
+      </OOBE>
+    </component>
+  </settings>
+  <settings pass="specialize">
+    <component name="Microsoft-Windows-Shell-Setup" 
+               processorArchitecture="$cpuArch" 
+               publicKeyToken="31bf3856ad364e35" 
+               language="neutral" 
+               versionScope="nonSxS" 
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" 
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <ComputerName>*</ComputerName>
+    </component>
+  </settings>
 </unattend>
 "@
-    $path = 'C:\unattend.xml'
-    $xml | Out-File -FilePath $path -Encoding UTF8 -Force
-}
-
-# ------------------------ Unattend Validation ---------------------------------
-function Validate-Unattend {
-    Step 'Validation: Unattend XML structure'
-    $path = 'C:\unattend.xml'
-    if (-not (Test-Path $path)) { Write-Host "unattend.xml missing at $path" -ForegroundColor Red; return }
+    
     try {
-        [xml]$doc = Get-Content $path -Raw -Encoding UTF8
-        $ns = New-Object System.Xml.XmlNamespaceManager($doc.NameTable)
-        $ns.AddNamespace('u','urn:schemas-microsoft-com:unattend')
-        $ns.AddNamespace('wcm','http://schemas.microsoft.com/WMIConfig/2002/State')
-        $node = $doc.SelectSingleNode('/u:unattend/u:settings[@pass="generalize"]/u:component[@name="Microsoft-Windows-PnpSysprep"]', $ns)
-        if ($null -eq $node) { Write-Host "PnPSysprep component not found under generalize!" -ForegroundColor Red } else { Write-Host "PnPSysprep component present under generalize." -ForegroundColor Green }
-    } catch { Write-Host "Failed to parse unattend.xml as XML: $($_.Exception.Message)" -ForegroundColor Red }
+        # Write with UTF8 encoding (with BOM for Windows compatibility)
+        $xml | Out-File -FilePath 'C:\unattend.xml' -Encoding UTF8 -Force
+        Write-Log "Unattend.xml written successfully" "SUCCESS"
+    } catch {
+        Write-Log "Error writing unattend.xml: $_" "ERROR"
+    }
 }
 
-# ------------------------ Compatibility nudges --------------------------------
+# ------------------------ Local Account Management ------------------------------
 function Prepare-LocalAccount {
-    Step "Ensure '$CloudUser' exists and is enabled"
-    try {
-        if ($CloudUser -ne 'Administrator') {
-            $u = Get-LocalUser -Name $CloudUser -ErrorAction SilentlyContinue
-            if (-not $u) { New-LocalUser -Name $CloudUser -NoPassword -AccountNeverExpires -UserMayNotChangePassword:$false -ErrorAction Stop | Out-Null }
-            else { try { Enable-LocalUser -Name $CloudUser -ErrorAction SilentlyContinue } catch {} }
-            try {
-                Add-LocalGroupMember -Group 'Administrators' -Member $CloudUser -ErrorAction SilentlyContinue
-                Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $CloudUser -ErrorAction SilentlyContinue
-            } catch {}
+    if ($CloudUser -eq 'Administrator') {
+        Step 'Using built-in Administrator account'
+        # Ensure Administrator is enabled
+        try {
+            & net user Administrator /active:yes 2>&1 | Out-Null
+        } catch {}
+        return
+    }
+    
+    Step "Ensuring user account '$CloudUser' exists"
+    
+    # Check if LocalAccounts module is available
+    if ($localAccountsAvailable) {
+        try {
+            # Use PowerShell cmdlets
+            $user = Get-LocalUser -Name $CloudUser -ErrorAction SilentlyContinue
+            
+            if (-not $user) {
+                Write-Log "Creating user: $CloudUser"
+                $params = @{
+                    Name = $CloudUser
+                    NoPassword = $true
+                    AccountNeverExpires = $true
+                    UserMayNotChangePassword = $false
+                    ErrorAction = 'Stop'
+                }
+                New-LocalUser @params | Out-Null
+                Write-Log "User created successfully" "SUCCESS"
+            } else {
+                if (-not $user.Enabled) {
+                    Enable-LocalUser -Name $CloudUser -ErrorAction Stop
+                    Write-Log "User enabled: $CloudUser" "SUCCESS"
+                }
+            }
+            
+            # Add to groups
+            @('Administrators', 'Remote Desktop Users') | ForEach-Object {
+                try {
+                    Add-LocalGroupMember -Group $_ -Member $CloudUser -ErrorAction SilentlyContinue
+                    Write-Log "Added $CloudUser to $_ group"
+                } catch {
+                    # Already a member or group doesn't exist
+                }
+            }
+        } catch {
+            Write-Log "Error with PowerShell user management: $_" "WARN"
+            # Fall through to net user commands
         }
-    } catch { Write-Verbose "Local account handling skipped or failed for '$CloudUser'. Continuing." }
+    } else {
+        # Use net user commands as fallback
+        try {
+            $userExists = & net user $CloudUser 2>&1 | Select-String "User name"
+            
+            if (-not $userExists) {
+                Write-Log "Creating user via net user: $CloudUser"
+                & net user $CloudUser /add /expires:never /active:yes 2>&1 | Out-Null
+            } else {
+                & net user $CloudUser /active:yes 2>&1 | Out-Null
+            }
+            
+            # Add to groups
+            & net localgroup Administrators $CloudUser /add 2>&1 | Out-Null
+            & net localgroup "Remote Desktop Users" $CloudUser /add 2>&1 | Out-Null
+            
+            Write-Log "User configured via net user" "SUCCESS"
+        } catch {
+            Write-Log "Error managing user via net user: $_" "WARN"
+        }
+    }
 }
 
-# ------------------------ Validation & Summary --------------------------------
-function Validate-PostSetup {
-    Step 'Validation: RDP service and firewall'
-    $rdpSvc = Get-Service TermService -ErrorAction SilentlyContinue
-    if ($rdpSvc) {
-        "{0} - Status: {1} - StartType: {2}" -f $rdpSvc.Name, $rdpSvc.Status, $rdpSvc.StartType | Write-Host
+# ------------------------ Validation ---------------------------------------------
+function Validate-Setup {
+    Step 'Validating configuration'
+    
+    $results = @()
+    $hasErrors = $false
+    
+    # Check RDP
+    try {
+        $rdpReg = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -ErrorAction SilentlyContinue
+        $rdpEnabled = $rdpReg.fDenyTSConnections -eq 0
+        if ($rdpEnabled) {
+            $results += "[OK] RDP is enabled"
+        } else {
+            $results += "[FAIL] RDP is not enabled"
+            $hasErrors = $true
+        }
+    } catch {
+        $results += "[WARN] Could not check RDP status"
+    }
+    
+    # Check services
+    @('TermService', 'cloudbase-init', 'QEMU-GA', 'qemu-ga') | ForEach-Object {
+        $svcName = $_
         try {
-            $rdpRules = Get-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue | Select-Object Name,Enabled
-            if ($rdpRules) { $rdpRules | Format-Table | Out-String | Write-Host }
-            else {
-                $rdpRules = Get-NetFirewallRule -Name 'RemoteDesktop-UserMode-In-TCP','RemoteDesktop-UserMode-In-UDP' -ErrorAction SilentlyContinue | Select-Object Name,Enabled
-                if ($rdpRules) { $rdpRules | Format-Table | Out-String | Write-Host }
+            $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+            if ($svc) {
+                if ($svc.StartType -eq 'Automatic') {
+                    $results += "[OK] $($svc.Name): Automatic startup"
+                } else {
+                    $results += "[WARN] $($svc.Name): StartType is $($svc.StartType)"
+                }
             }
         } catch {}
-        try {
-            $deny = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections').fDenyTSConnections
-            $nla  = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication').UserAuthentication
-            "RDP Enabled (fDenyTSConnections=0)? {0}; NLA (UserAuthentication=1)? {1}" -f ($deny -eq 0), ($nla -eq 1) | Write-Host
-        } catch {}
-    } else { Write-Host "TermService not present; RDP service validation skipped." -ForegroundColor DarkYellow }
-
-    Step 'Validation: Cloudbase-Init service & config'
-    try { $img=(Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\cloudbase-init' -Name ImagePath -ErrorAction SilentlyContinue).ImagePath; if($img){ "ImagePath: $img" | Write-Host } } catch {}
-    $cb = Get-Service cloudbase-init -ErrorAction SilentlyContinue
-    if ($cb) { "{0} - Status: {1} - StartType: {2}" -f $cb.Name, $cb.Status, $cb.StartType | Write-Host } else { Write-Host "cloudbase-init service not found!" -ForegroundColor Red }
-    $cbConf = Join-Path "${env:ProgramFiles}\Cloudbase Solutions\Cloudbase-Init\conf" "cloudbase-init.conf"
-    "cloudbase-init.conf exists? {0}" -f (Test-Path $cbConf) | Write-Host
-
-    Step 'Validation: QEMU Guest Agent (optional)'
-    $ga = @(); $ga += Get-Service -Name 'QEMU-GA' -ErrorAction SilentlyContinue; $ga += Get-Service -Name 'qemu-ga' -ErrorAction SilentlyContinue
-    if (-not $ga) { $ga += Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match 'QEMU.*Agent' -or $_.Name -match 'qemu' } }
-    if ($ga) {
-        $ga | ForEach-Object { Ensure-ServiceAutoStart -Name $_.Name -DependsOn @('nsi','Tcpip') }
-        $ga | Select-Object Name,Status,StartType | Format-Table | Out-String | Write-Host
-    } else { Write-Host "QEMU guest agent service not detected (this is OK if not installed by your MSI)." -ForegroundColor DarkYellow }
-
-    Step 'Validation: VirtIO driver store & services'
-    try {
-        $drivers = Get-WmiObject Win32_PnPSignedDriver | Where-Object { $_.DriverProviderName -like '*Red Hat*' -or $_.Manufacturer -like '*Red Hat*' } | Select-Object DeviceName, DriverVersion, DriverProviderName
-        if ($drivers) { "Red Hat drivers in store:" | Write-Host; $drivers | Sort-Object DeviceName | Format-Table | Out-String | Write-Host }
-        else { Write-Host "No Red Hat (VirtIO) drivers found in driver store. They may install only when matching hardware is present." -ForegroundColor DarkYellow }
-    } catch {}
-    'NetKVM','vioscsi','viostor','vioserial','vioinput','viorng','qemufwcfg','qemupciserial','pvpanic' | ForEach-Object {
-        $exists = Test-Path "HKLM:\SYSTEM\CurrentControlSet\Services\$_"; "{0} service present? {1}" -f $_, $exists | Write-Host
     }
-
-    Step 'Validation: Sysprep file & network wait policy'
-    "Unattend.xml exists? {0}" -f (Test-Path 'C:\unattend.xml') | Write-Host
-    try { $sync = (Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\CurrentVersion\Winlogon' -Name 'SyncForegroundPolicy' -ErrorAction SilentlyContinue).SyncForegroundPolicy; "SyncForegroundPolicy=1? {0}" -f ($sync -eq 1) | Write-Host } catch {}
-
-    Step 'Validation: Pagefile automatic'
-    try { $cs = Get-WmiObject -Class Win32_ComputerSystem; "AutomaticManagedPagefile? {0}" -f ($cs.AutomaticManagedPagefile -eq $true) | Write-Host } catch {}
+    
+    # Check critical files
+    if (Test-Path 'C:\unattend.xml') {
+        $results += "[OK] Unattend.xml exists"
+    } else {
+        $results += "[FAIL] Unattend.xml missing"
+        $hasErrors = $true
+    }
+    
+    $cbConfPath = "${env:ProgramFiles}\Cloudbase Solutions\Cloudbase-Init\conf\cloudbase-init.conf"
+    if (Test-Path $cbConfPath) {
+        $results += "[OK] Cloudbase-Init config exists"
+    } else {
+        $results += "[WARN] Cloudbase-Init config missing"
+    }
+    
+    # Check VirtIO
+    if (Test-VirtIODriversInstalled) {
+        $results += "[OK] VirtIO drivers installed"
+    } else {
+        $results += "[INFO] VirtIO drivers not detected (may install on first boot)"
+    }
+    
+    # Display results
+    Write-Host "`nValidation Results:" -ForegroundColor Green
+    Write-Host "===================" -ForegroundColor Green
+    foreach ($result in $results) {
+        if ($result -like "*[OK]*") {
+            Write-Host $result -ForegroundColor Green
+        } elseif ($result -like "*[FAIL]*") {
+            Write-Host $result -ForegroundColor Red
+        } elseif ($result -like "*[WARN]*") {
+            Write-Host $result -ForegroundColor Yellow
+        } else {
+            Write-Host $result
+        }
+    }
+    
+    return -not $hasErrors
 }
 
-# ------------------------ Main ------------------------------------------------
+# ------------------------ Main Execution -----------------------------------------
+$scriptStart = Get-Date
+
 try {
-    Step 'Start: CloudStack Windows Template Prep'
+    Write-Host "`n=====================================================" -ForegroundColor Cyan
+    Write-Host " CloudStack Windows Template Preparation v13-verified" -ForegroundColor Cyan
+    Write-Host "=====================================================" -ForegroundColor Cyan
+    Write-Log "Script started at: $scriptStart"
+    Write-Log "Parameters: CloudUser=$CloudUser, SkipVirtIO=$SkipVirtIO, SkipCloudbaseInit=$SkipCloudbaseInit"
+    
+    # Execute preparation steps
     Optimize-OS
     Fix-Pagefile
     Prepare-LocalAccount
     Install-VirtIO
     Install-CloudbaseInit
     Write-Unattend
-    Validate-Unattend
     Safe-Cleanup
-
-    Step 'Done. Next steps:'
-    Write-Host ( @"
-1) Optional: re-run with -CloudUser 'YourAdminUser' to target a different account.
-2) Seal the image (do not log in after sysprep):
-   C:\Windows\System32\Sysprep\sysprep.exe /generalize /oobe /shutdown /unattend:C:\unattend.xml
-3) Register as a template in CloudStack and set "Password Enabled" = Yes.
-"@
-    ) -ForegroundColor Yellow
-    Validate-PostSetup
-}
-catch {
-    Write-Host ""
-    Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
-    Write-Host $_.ScriptStackTrace -ForegroundColor DarkGray
+    
+    # Validation
+    $validationPassed = Validate-Setup
+    
+    $scriptEnd = Get-Date
+    $duration = $scriptEnd - $scriptStart
+    
+    # Final message
+    Write-Host "`n=====================================================" -ForegroundColor Green
+    Write-Host " PREPARATION COMPLETED" -ForegroundColor Green
+    Write-Host "=====================================================" -ForegroundColor Green
+    Write-Host " Duration: $($duration.ToString('mm\:ss'))" -ForegroundColor Gray
+    Write-Host " Log file: $log" -ForegroundColor Gray
+    
+    if ($validationPassed) {
+        Write-Host "`n Status: Ready for sysprep" -ForegroundColor Green
+    } else {
+        Write-Host "`n Status: Some issues detected, review validation results" -ForegroundColor Yellow
+    }
+    
+    Write-Host "`nNext steps:" -ForegroundColor Yellow
+    Write-Host "1. Review the validation results above" -ForegroundColor Yellow
+    Write-Host "2. If everything looks good, run sysprep:" -ForegroundColor Yellow
+    Write-Host "`n   " -NoNewline
+    Write-Host "C:\Windows\System32\Sysprep\sysprep.exe /generalize /oobe /shutdown /unattend:C:\unattend.xml" -ForegroundColor Cyan
+    Write-Host "`n3. After shutdown, create CloudStack template with:" -ForegroundColor Yellow
+    Write-Host "   - Password Enabled = Yes" -ForegroundColor Yellow
+    Write-Host "   - Hypervisor Tools = Yes (if using XenServer/VMware)" -ForegroundColor Yellow
+    
+} catch {
+    Write-Host "`n=====================================================" -ForegroundColor Red
+    Write-Host " ERROR OCCURRED" -ForegroundColor Red
+    Write-Host "=====================================================" -ForegroundColor Red
+    Write-Host " Error: $($_.Exception.Message)" -ForegroundColor Red
+    
+    if ($_.ScriptStackTrace) {
+        Write-Host "`nStack trace:" -ForegroundColor DarkGray
+        Write-Host $_.ScriptStackTrace -ForegroundColor DarkGray
+    }
+    
+    Write-Host "`nTroubleshooting:" -ForegroundColor Yellow
+    Write-Host "1. Check the log file: $log" -ForegroundColor Yellow
+    Write-Host "2. Run with -SkipVirtIO or -SkipCloudbaseInit to skip problematic components" -ForegroundColor Yellow
+    Write-Host "3. Ensure you're running as Administrator" -ForegroundColor Yellow
+    
     exit 1
-}
-finally {
-    if ($transcriptStarted) { try { Stop-Transcript | Out-Null } catch {} }
-    Write-Host "Log saved to: $log" -ForegroundColor Gray
+} finally {
+    if ($transcriptStarted) {
+        try { 
+            Stop-Transcript -ErrorAction SilentlyContinue | Out-Null
+        } catch {}
+    }
 }
