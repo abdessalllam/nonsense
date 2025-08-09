@@ -359,7 +359,7 @@ function Validate-Unattend {
     }
 }
 # ------------------------ Validation & Summary --------------------------------
-function Validate-Unattend`n    Validate-PostSetup {
+function Validate-PostSetup {
     Step 'Validation: RDP service and firewall'
     $rdpSvc = Get-Service TermService -ErrorAction SilentlyContinue
     if ($rdpSvc) {
@@ -449,6 +449,7 @@ try {
     Write-Unattend
     Safe-Cleanup
 
+    Validate-Unattend
     Validate-PostSetup
 
     Step 'Done. Next steps:'
