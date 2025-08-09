@@ -718,11 +718,11 @@ function Install-CloudbaseInit {
         'cloudbaseinit.plugins.common.mtu.MTUPlugin',
         'cloudbaseinit.plugins.common.sethostname.SetHostNamePlugin',
         'cloudbaseinit.plugins.windows.createuser.CreateUserPlugin',
+        'cloudbaseinit.plugins.common.setuserpassword.SetUserPasswordPlugin',  
         'cloudbaseinit.plugins.common.networkconfig.NetworkConfigPlugin',
         'cloudbaseinit.plugins.windows.licensing.WindowsLicensingPlugin',
         'cloudbaseinit.plugins.common.sshpublickeys.SetUserSSHPublicKeysPlugin',
         'cloudbaseinit.plugins.windows.extendvolumes.ExtendVolumesPlugin',
-        'cloudbaseinit.plugins.common.setuserpassword.SetUserPasswordPlugin',
         'cloudbaseinit.plugins.common.localscripts.LocalScriptsPlugin'
     )
     
@@ -731,7 +731,7 @@ function Install-CloudbaseInit {
 username=$CloudUser
 groups=Administrators
 inject_user_password=true
-first_logon_behaviour=no
+first_logon_behaviour=always
 metadata_services=cloudbaseinit.metadata.services.cloudstack.CloudStack
 plugins=$($pluginList -join ',')
 verbose=true
@@ -763,6 +763,37 @@ check_latest_version=false
         Write-Log "Stopped cloudbase-init service (will start after sysprep)"
     } catch {}
 }
+function Relax-PasswordPolicyForTemplate {
+    Step 'Relax password policy to accept CloudStack password'
+    $inf = @"
+[Version]
+signature="$CHICAGO$"
+
+[System Access]
+MinimumPasswordLength = 1
+PasswordComplexity = 0
+MaximumPasswordAge = 0
+PasswordHistorySize = 0
+"@
+    $infPath = "$env:TEMP\pwd.inf"
+    $dbPath  = "$env:TEMP\secpol.sdb"
+    $inf | Out-File -FilePath $infPath -Encoding ASCII -Force
+    & secedit /configure /db "$dbPath" /cfg "$infPath" /areas SECURITYPOLICY | Out-Null
+
+    try {
+        # Set service to Manual (will be started by unattend.xml at the right time)
+        Set-Service -Name 'cloudbase-init' -StartupType Manual -ErrorAction Stop
+        
+        # Add dependency on network services
+        $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\cloudbase-init"
+        Set-RegistryValue -Path $regPath -Name 'DependOnService' -Value @('Dhcp','Dnscache','LanmanServer') -RegType 'MultiString'
+        
+        # Don't start the service now - let unattend.xml handle it
+        Write-Log "Cloudbase-init service configured for sysprep startup"
+    } catch {
+        Write-Log "Error configuring service: $_" "WARN"
+    }
+}
 
 # ------------------------ Unattend.xml ------------------------------------------
 function Write-Unattend {
@@ -785,6 +816,39 @@ function Write-Unattend {
       <DoNotCleanUpNonPresentDevices>true</DoNotCleanUpNonPresentDevices>
     </component>
   </settings>
+  <settings pass="specialize">
+    <component name="Microsoft-Windows-Shell-Setup" 
+               processorArchitecture="$cpuArch" 
+               publicKeyToken="31bf3856ad364e35" 
+               language="neutral" 
+               versionScope="nonSxS" 
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" 
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <ComputerName>*</ComputerName>
+    </component>
+    <component name="Microsoft-Windows-Deployment" 
+               processorArchitecture="$cpuArch" 
+               publicKeyToken="31bf3856ad364e35" 
+               language="neutral" 
+               versionScope="nonSxS" 
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" 
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Path>cmd.exe /c "sc config cloudbase-init start= auto"</Path>
+          <Description>Set Cloudbase-Init to auto start</Description>
+          <WillReboot>Never</WillReboot>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <Path>cmd.exe /c "net start cloudbase-init"</Path>
+          <Description>Start Cloudbase-Init service</Description>
+          <WillReboot>Never</WillReboot>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+    </component>
+  </settings>
   <settings pass="oobeSystem">
     <component name="Microsoft-Windows-Shell-Setup" 
                processorArchitecture="$cpuArch" 
@@ -803,17 +867,14 @@ function Write-Unattend {
         <SkipMachineOOBE>true</SkipMachineOOBE>
         <SkipUserOOBE>true</SkipUserOOBE>
       </OOBE>
-    </component>
-  </settings>
-  <settings pass="specialize">
-    <component name="Microsoft-Windows-Shell-Setup" 
-               processorArchitecture="$cpuArch" 
-               publicKeyToken="31bf3856ad364e35" 
-               language="neutral" 
-               versionScope="nonSxS" 
-               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" 
-               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
-      <ComputerName>*</ComputerName>
+      <FirstLogonCommands>
+        <SynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <CommandLine>cmd.exe /c "C:\Program Files\Cloudbase Solutions\Cloudbase-Init\bin\cloudbase-init.exe --config-file C:\Program Files\Cloudbase Solutions\Cloudbase-Init\conf\cloudbase-init.conf"</CommandLine>
+          <Description>Run Cloudbase-Init to set password</Description>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+      </FirstLogonCommands>
     </component>
   </settings>
 </unattend>
@@ -827,7 +888,6 @@ function Write-Unattend {
         Write-Log "Error writing unattend.xml: $_" "ERROR"
     }
 }
-
 # ------------------------ Local Account Management ------------------------------
 function Prepare-LocalAccount {
     if ($CloudUser -eq 'Administrator') {
@@ -994,6 +1054,7 @@ try {
     Prepare-LocalAccount
     Install-VirtIO
     Install-CloudbaseInit
+    Relax-PasswordPolicyForTemplate
     Write-Unattend
     Safe-Cleanup
     
