@@ -367,6 +367,26 @@ function Optimize-OS {
         } else {
             Write-Log "Could not set RDP registry value" "WARN"
         }
+            Step 'Configure network wait at startup'
+    try {
+        # Group Policy setting for network wait
+        $winlogonPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\CurrentVersion\Winlogon'
+        if (Set-RegistryValue -Path $winlogonPath -Name 'SyncForegroundPolicy' -Value 1 -RegType 'DWord') {
+            Write-Log "Network wait policy configured" "SUCCESS"
+        }
+        
+        # Additional network readiness settings
+        $netLogonPath = 'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters'
+        Set-RegistryValue -Path $netLogonPath -Name 'RequireSignOrSeal' -Value 0 -RegType 'DWord'
+        Set-RegistryValue -Path $netLogonPath -Name 'RequireStrongKey' -Value 0 -RegType 'DWord'
+        
+        # Ensure DHCP client is set to automatic
+        Set-Service -Name 'Dhcp' -StartupType Automatic -ErrorAction SilentlyContinue
+        
+        Write-Log "Network services configured for cloud environment" "SUCCESS"
+    } catch {
+        Write-Log "Error setting network policies: $_" "WARN"
+    }
         
         # Enable NLA
         $rdpTcpPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
