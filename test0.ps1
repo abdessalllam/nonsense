@@ -452,12 +452,13 @@ try {
     Validate-PostSetup
 
     Step 'Done. Next steps:'
-    Write-Host @"
+    Write-Host (@"
 1) Optional: re-run with -CloudUser 'YourAdminUser' to target a different account.
 2) Seal the image (do not log in after sysprep):
    C:\Windows\System32\Sysprep\sysprep.exe /generalize /oobe /shutdown /unattend:C:\unattend.xml
 3) Register as a template in CloudStack and set "Password Enabled" = Yes.
-"@ -ForegroundColor Yellow
+"@
+) -ForegroundColor Yellow
 }
 catch {
     Write-Host ""
